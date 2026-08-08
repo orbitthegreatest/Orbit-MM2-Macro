@@ -1,12 +1,17 @@
 This macro utility is mainly for the famous Roblox game "Murder Mystery 2". To download, go to the release section in the GitHub page then grab the lastest .exe.
-
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 SETUP
+
 1. Put you your roblox sensitivity and you Roblox FPS in the main page
 2. Enable the macros you want
 3. Click save
 
 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
 HOW TO USE THE SPEED GLITCH MACRO
+
 Quick checks:
 - Make sure to have 100% display scale or the macro will glitch out
 - Make sure you have put your Roblox sensitivity and FPS in the main pag or it will not work correctly
@@ -23,7 +28,11 @@ Steps:
 9. Enjoy the speed glitch ;)
 
 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
 HOW TO USE THE SIT MACRO
+
 Steps:
 1. Enable the macro in the Sit macro page
 2. Go check your slot for the sit emote in MM2 and enter it in "sit slot"
@@ -33,7 +42,11 @@ Steps:
 6. Enjoy the sit macro ;)
 
 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
 HOW TO USE THE POOL SUPER JUMP MACRO
+
 Quick checks:
 - Make sure to have 100% display scale or the macro will glitch out
 - Make sure you have put your Roblox sensitivity and FPS in the main pag or it will not work correctly
@@ -47,7 +60,11 @@ Steps:
 6. Enjoy the pool super jump macro ;)
 
 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
 HOW TO USE EQUIP ITEMS MACRO
+
 Steps:
 1. Enable the macro in the Equip items page
 2. Click new to add a new config
@@ -62,7 +79,11 @@ Steps:
 11. Enjoy the equip items macro ;)
 
 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
 HOW TO USE THE LAG SWITCH MACRO
+
 Steps: 
 1. Enable the macro in the Lag switch page
 2. Bind your hotkey
