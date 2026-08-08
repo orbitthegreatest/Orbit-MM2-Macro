@@ -106,6 +106,7 @@ static Macro g_editingMacro;
 static bool g_editingNew = true;
 static std::map<std::string, Macro> g_macros;
 static std::atomic<bool> g_glitchActive{false};
+static std::atomic<bool> g_spamActive{false};
 
 // Lag-switch dynamic module state. Kept together so EnableLagSwitch/DisableLagSwitch
 // can operate against the resolved WinDivert pointers without touching globals elsewhere.
@@ -122,6 +123,7 @@ static HWND g_statusLabelLag = nullptr;
 static HWND g_statusLabelSit = nullptr;
 static HWND g_statusLabelJump = nullptr;
 static HWND g_statusLabelGlitch = nullptr;
+static HWND g_statusLabelSpam = nullptr;
 
 struct Config {
     double sensitivity = 0.294;
@@ -146,6 +148,13 @@ struct Config {
     // screenshots; only the trigger key itself is personalisable.
     bool lagEnabled = false;
     UINT lagKey = 0;          // personalisable - no default key until the user records one
+
+    // Spam Sign (Spencer "Item Clip"). Slot and trigger key are personalisable;
+    // the 34ms cycle and the Roblox-focus requirement are hardcoded (defaults).
+    bool spamEnabled = false;
+    UINT spamKey = 0;         // personalisable - no default key until the user records one
+    int spamSlot = 7;         // gear slot repeatedly equipped/released
+    bool spamHoldMode = false; // checks "hold the trigger key while spam" like Spencer's toggle/hold
 } g_config;
 
 // Forward declarations
@@ -159,8 +168,10 @@ void HoldW(bool hold);
 void FrameDelays(int fps, int& d1, int& d2);
 void SleepMicro(int us);
 void SpeedGlitchWorker();
+void SpamSignWorker();
 void DoSuperJump();
 void OnHotkey(UINT vk, bool down);
+void OnSpamHotkey(UINT vk, bool down);
 void OnSitHotkey(UINT vk);
 void OnSuperJumpHotkey(UINT vk);
 void OnLagHotkey(UINT vk, bool down);
@@ -433,6 +444,11 @@ void LoadConfig() {
 
     g_config.lagEnabled = readBool("LagSwitch", "Enabled", false);
     g_config.lagKey = (UINT)readInt("LagSwitch", "TriggerKey", 0);
+
+    g_config.spamEnabled = readBool("SpamSign", "Enabled", false);
+    g_config.spamKey = (UINT)readInt("SpamSign", "TriggerKey", 0);
+    g_config.spamSlot = readInt("SpamSign", "Slot", 7);
+    g_config.spamHoldMode = readBool("SpamSign", "HoldMode", false);
 }
 
 void SaveConfig() {
@@ -456,6 +472,11 @@ void SaveConfig() {
 
     writeBool("LagSwitch", "Enabled", g_config.lagEnabled);
     writeInt("LagSwitch", "TriggerKey", g_config.lagKey);
+
+    writeBool("SpamSign", "Enabled", g_config.spamEnabled);
+    writeInt("SpamSign", "TriggerKey", g_config.spamKey);
+    writeInt("SpamSign", "Slot", g_config.spamSlot);
+    writeBool("SpamSign", "HoldMode", g_config.spamHoldMode);
 }
 
 // ==============================
@@ -774,6 +795,50 @@ void OnHotkey(UINT vk, bool down) {
     }
 }
 
+// ==============================
+//  Spam Sign worker (Spencer "Item Clip")
+// ==============================
+void SpamSignWorker() {
+    // Spencer default cycle: 34ms total (17ms equipped, 17ms released); only
+    // while the active loop runs and Roblox is focused.
+    const int halfDelay = 17;
+    int slot = g_config.spamSlot < 0 ? 0 : (g_config.spamSlot > 9 ? 9 : g_config.spamSlot);
+    const char key = '0' + slot;
+    while (g_spamActive) {
+        if (!IsRobloxFocused()) { SleepMicro(10000); continue; }
+        SendKey(key, true);  Sleep(halfDelay);
+        SendKey(key, false); Sleep(halfDelay);
+    }
+}
+
+void OnSpamHotkey(UINT vk, bool down) {
+    if (!g_config.spamEnabled || !IsRobloxFocused() || g_config.spamKey == 0) return;
+
+    // Hold Mode: spam only while the trigger is held (Spencer's checkbox says
+    // "Switch from Toggle Key to Hold Key"). Toggle Mode: press to start, press
+    // again to stop.
+    if (g_config.spamHoldMode) {
+        if (down && !g_spamActive) {
+            g_spamActive = true;
+            std::thread(SpamSignWorker).detach();
+            if (g_statusLabelSpam) SetWindowTextA(g_statusLabelSpam, "Spam: Running");
+        } else if (!down && g_spamActive) {
+            g_spamActive = false;
+            if (g_statusLabelSpam) SetWindowTextA(g_statusLabelSpam, "Spam: Stopped");
+        }
+    } else {
+        if (!down) return;
+        if (g_spamActive) {
+            g_spamActive = false;
+            if (g_statusLabelSpam) SetWindowTextA(g_statusLabelSpam, "Spam: Stopped");
+        } else {
+            g_spamActive = true;
+            std::thread(SpamSignWorker).detach();
+            if (g_statusLabelSpam) SetWindowTextA(g_statusLabelSpam, "Spam: Running");
+        }
+    }
+}
+
 void OnSitHotkey(UINT vk) {
     if (!g_config.sitEnabled || !IsRobloxFocused() || g_config.sitKey == 0) return;
     // Run on a background thread — this hook callback must return quickly or
@@ -863,6 +928,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             UINT vk = p->vkCode;
             if (vk == g_config.glitchKey && g_config.glitchKey)        OnHotkey(vk, down);
             else if (vk == g_config.lagKey && g_config.lagKey)         OnLagHotkey(vk, down);
+            else if (vk == g_config.spamKey && g_config.spamKey)       OnSpamHotkey(vk, down);
             else if (down) {
                 if (vk == g_config.sitKey && g_config.sitKey)          OnSitHotkey(vk);
                 else if (vk == g_config.superJumpKey && g_config.superJumpKey) OnSuperJumpHotkey(vk);
@@ -895,6 +961,8 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 if (down || up) OnHotkey(vk, down);
             } else if (vk == g_config.lagKey && g_config.lagKey) {
                 if (down || up) OnLagHotkey(vk, down);
+            } else if (vk == g_config.spamKey && g_config.spamKey) {
+                if (down || up) OnSpamHotkey(vk, down);
             } else if (down) {
                 if (vk == g_config.sitKey && g_config.sitKey)          OnSitHotkey(vk);
                 else if (vk == g_config.superJumpKey && g_config.superJumpKey) OnSuperJumpHotkey(vk);
@@ -1311,6 +1379,11 @@ void CALLBACK RecordTimerProc(HWND hwnd, UINT, UINT_PTR, DWORD) {
                 SetDlgItemTextA(hwnd, 413, name.c_str());
                 EnableWindow(GetDlgItem(hwnd, 414), TRUE);
                 SetDlgItemTextA(hwnd, 414, "Record");
+            } else if (g_recordingTarget == 4) {
+                g_config.spamKey = key;
+                SetDlgItemTextA(hwnd, 513, name.c_str());
+                EnableWindow(GetDlgItem(hwnd, 514), TRUE);
+                SetDlgItemTextA(hwnd, 514, "Record");
             }
             return;
         }
@@ -1342,6 +1415,11 @@ void CALLBACK RecordTimerProc(HWND hwnd, UINT, UINT_PTR, DWORD) {
                 SetDlgItemTextA(hwnd, 413, name);
                 EnableWindow(GetDlgItem(hwnd, 414), TRUE);
                 SetDlgItemTextA(hwnd, 414, "Record");
+            } else if (g_recordingTarget == 4) {
+                g_config.spamKey = key;
+                SetDlgItemTextA(hwnd, 513, name);
+                EnableWindow(GetDlgItem(hwnd, 514), TRUE);
+                SetDlgItemTextA(hwnd, 514, "Record");
             }
             return;
         }
@@ -1387,8 +1465,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
             TCITEMA tie = {};
             tie.mask = TCIF_TEXT;
-            const char* tabLabels[] = { "Main", "Speed Glitch", "Sit Macro", "Pool Super Jump", "Equip Items", "Lag Switch" };
-            for (int i = 0; i < 6; ++i) {
+            const char* tabLabels[] = { "Main", "Speed Glitch", "Sit Macro", "Pool Super Jump", "Equip Items", "Lag Switch", "Spam Sign" };
+            for (int i = 0; i < 7; ++i) {
                 tie.pszText = (char*)tabLabels[i];
                 TabCtrl_InsertItem(hTab, i, &tie);
             }
@@ -1451,6 +1529,21 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowExA(0, "BUTTON", "Enabled", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 36, 150, 100, 25, hwnd, (HMENU)415, GetModuleHandle(NULL), NULL);
             g_statusLabelLag = CreateWindowExA(0, "STATIC", "Lag: idle", WS_CHILD | WS_VISIBLE, 36, 190, 400, 20, hwnd, (HMENU)416, GetModuleHandle(NULL), NULL);
 
+            // --- Tab 6: Spam Sign (Spencer "Item Clip") ---
+            CreateWindowExA(0, "STATIC", "Trigger Key:", WS_CHILD | WS_VISIBLE, 36, 108, 100, 20, hwnd, (HMENU)1601, GetModuleHandle(NULL), NULL);
+            CreateWindowExA(0, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_UPPERCASE, 150, 105, 80, 24, hwnd, (HMENU)513, GetModuleHandle(NULL), NULL);
+            CreateWindowExA(0, "BUTTON", "Record", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 240, 105, 70, 24, hwnd, (HMENU)514, GetModuleHandle(NULL), NULL);
+            CreateWindowExA(0, "BUTTON", "Hold Key", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 36, 150, 150, 25, hwnd, (HMENU)515, GetModuleHandle(NULL), NULL);
+            CreateWindowExA(0, "STATIC", "Item Slot:", WS_CHILD | WS_VISIBLE, 36, 195, 100, 20, hwnd, (HMENU)1602, GetModuleHandle(NULL), NULL);
+            CreateWindowExA(0, "COMBOBOX", "", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+                            150, 192, 80, 150, hwnd, (HMENU)516, GetModuleHandle(NULL), NULL);
+            for (int i = 1; i <= 9; ++i) {
+                char buf[8]; sprintf_s(buf, "%d", i);
+                SendDlgItemMessageA(hwnd, 516, CB_ADDSTRING, 0, (LPARAM)buf);
+            }
+            CreateWindowExA(0, "BUTTON", "Enabled", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 36, 240, 100, 25, hwnd, (HMENU)517, GetModuleHandle(NULL), NULL);
+            g_statusLabelSpam = CreateWindowExA(0, "STATIC", "Spam: idle", WS_CHILD | WS_VISIBLE, 36, 278, 400, 20, hwnd, (HMENU)518, GetModuleHandle(NULL), NULL);
+
             HWND hLV2 = GetDlgItem(hwnd, 401);
             int idx = 0;
             for (auto& pair : g_macros) {
@@ -1490,13 +1583,19 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetDlgItemTextA(hwnd, 413, KeyName(g_config.lagKey).c_str());
             CheckDlgButton(hwnd, 415, g_config.lagEnabled ? BST_CHECKED : BST_UNCHECKED);
 
+            SetDlgItemTextA(hwnd, 513, KeyName(g_config.spamKey).c_str());
+            CheckDlgButton(hwnd, 515, g_config.spamHoldMode ? BST_CHECKED : BST_UNCHECKED);
+            SendDlgItemMessageA(hwnd, 516, CB_SETCURSEL, g_config.spamSlot - 1, 0);
+            CheckDlgButton(hwnd, 517, g_config.spamEnabled ? BST_CHECKED : BST_UNCHECKED);
+
             // Show only Main
             int allIds[] = {110,111,501,1101,1102,
                             112,113,114,115,116,1104,
                             202,203,204,205,206,1201,1202,
-302,303,306,308,1301,
+                            302,303,306,308,1301,
                                 401,402,403,404,405,
-                                413,414,415,416,1401};
+                                413,414,415,416,1401,
+                                513,514,515,516,517,518,1601,1602};
             for (int id : allIds) ShowWindow(GetDlgItem(hwnd, id), SW_HIDE);
             for (int id : {110,111,501,1101,1102}) ShowWindow(GetDlgItem(hwnd, id), SW_SHOW);
 
@@ -1521,7 +1620,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             int id = GetDlgCtrlID(ctl);
             HDC dc = (HDC)wParam;
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, (id == 116 || id == 206 || id == 308 || id == 416) ? COL_ACCENT_LT : COL_TEXT);
+            SetTextColor(dc, (id == 116 || id == 206 || id == 308 || id == 416 || id == 518) ? COL_ACCENT_LT : COL_TEXT);
             return (LRESULT)g_hbrBg;
         }
         case WM_CTLCOLOREDIT:
@@ -1548,12 +1647,13 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             NMHDR* hdr = (NMHDR*)lParam;
             if (hdr->idFrom == 100 && hdr->code == TCN_SELCHANGE) {
                 int tab = TabCtrl_GetCurSel(hTab);
-                int allIds[] = {110,111,501,1101,1102,
+int allIds[] = {110,111,501,1101,1102,
                                 112,113,114,115,116,1104,
                                 202,203,204,205,206,1201,1202,
-302,303,306,308,1301,
+                                302,303,306,308,1301,
                                 401,402,403,404,405,
-                                413,414,415,416,1401};
+                                413,414,415,416,1401,
+                                513,514,515,516,517,518,1601,1602};
                 for (int id : allIds) ShowWindow(GetDlgItem(hwnd, id), SW_HIDE);
                 switch (tab) {
                     case 0: for (int id : {110,111,501,1101,1102}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
@@ -1562,6 +1662,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     case 3: for (int id : {302,303,306,308,1301}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
                     case 4: for (int id : {401,402,403,404,405}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
                     case 5: for (int id : {413,414,415,416,1401}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
+                    case 6: for (int id : {513,514,515,516,517,518,1601,1602}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
                 }
                 return 0;
             }
@@ -1591,6 +1692,12 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 case 414: // Record lag switch key
                     if (!g_recording) { g_recording = true; g_recordingTarget = 3;
                         SetDlgItemTextA(hwnd, 414, "..."); EnableWindow(GetDlgItem(hwnd, 414), FALSE);
+                        SetTimer(hwnd, 1, 50, (TIMERPROC)RecordTimerProc);
+                    }
+                    break;
+                case 514: // Record spam key
+                    if (!g_recording) { g_recording = true; g_recordingTarget = 4;
+                        SetDlgItemTextA(hwnd, 514, "..."); EnableWindow(GetDlgItem(hwnd, 514), FALSE);
                         SetTimer(hwnd, 1, 50, (TIMERPROC)RecordTimerProc);
                     }
                     break;
@@ -1649,6 +1756,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     bool newSuperJumpEnabled = (IsDlgButtonChecked(hwnd, 306) == BST_CHECKED);
                     bool newEquipEnabled = (IsDlgButtonChecked(hwnd, 405) == BST_CHECKED);
                     bool newLagEnabled = (IsDlgButtonChecked(hwnd, 415) == BST_CHECKED);
+                    bool newSpamEnabled = (IsDlgButtonChecked(hwnd, 517) == BST_CHECKED);
+                    bool newSpamHoldMode = (IsDlgButtonChecked(hwnd, 515) == BST_CHECKED);
+                    int newSpamSlot = (int)SendDlgItemMessageA(hwnd, 516, CB_GETCURSEL, 0, 0) + 1;
+                    if (newSpamSlot < 0) newSpamSlot = 0;
 
                     // Guard against two enabled macros sharing the same trigger key —
                     // only the first match ever fires, which makes the second one look broken.
@@ -1658,10 +1769,11 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                         { g_config.sitKey,        newSitEnabled,       "Sit Macro" },
                         { g_config.superJumpKey,  newSuperJumpEnabled, "Pool Super Jump" },
                         { g_config.lagKey,        newLagEnabled,       "Lag Switch" },
+                        { g_config.spamKey,       newSpamEnabled,      "Spam Sign" },
                     };
-                    for (int i = 0; i < 4; ++i) {
+                    for (int i = 0; i < 5; ++i) {
                         if (!owners[i].enabled) continue;
-                        for (int j = i + 1; j < 3; ++j) {
+                        for (int j = i + 1; j < 5; ++j) {
                             if (owners[j].enabled && owners[i].key == owners[j].key) {
                                 char msg[256];
                                 sprintf_s(msg, "'%s' and '%s' are both bound to the same key (%s).\n"
@@ -1672,7 +1784,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                             }
                         }
                     }
-                    for (int i = 1; i < 4; ++i) {
+                    for (int i = 1; i < 5; ++i) {
                         if (!owners[i].enabled || owners[i].key == 0) continue;
                         for (auto& pair : g_macros) {
                             if (!newEquipEnabled) break;
@@ -1696,6 +1808,9 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                     g_config.superJumpEnabled = newSuperJumpEnabled;
                     g_config.equipEnabled = newEquipEnabled;
                     g_config.lagEnabled = newLagEnabled;
+                    g_config.spamEnabled = newSpamEnabled;
+                    g_config.spamHoldMode = newSpamHoldMode;
+                    g_config.spamSlot = newSpamSlot;
                     SaveConfig();
                     DestroyWindow(hwnd);
                     g_hwndSettings = nullptr;
