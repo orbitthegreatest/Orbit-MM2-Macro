@@ -90,3 +90,18 @@ Steps:
 3. Go in mm2
 4. Press your hotkey
 5. Enjoy the lag switch macro ;)
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+HOW TO USE THE SPAM SIGN MACRO
+
+Steps:
+1. Enable the macro in the Spam sign page
+2. Put the number of your hotbar slot where the sign is at in the item slot
+3. Enable/Disable hold key (toggle/hold)
+4. Choose your keybind
+5. Join MM2 and take your sign
+6. Press your hotkey
+7. Enjoy the spam sign macro ;)
