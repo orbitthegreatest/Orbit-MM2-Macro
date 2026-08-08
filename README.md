@@ -40,11 +40,32 @@ Quick checks:
 
 Steps:
 1. Enable the macro in the Pool Super Jump page
-2. Enable/Disable "Space dur" 
-3. Record your hotkey
-4. Click save
-5. Go on Murder Mystery 2
-6. Equip an heavy items (i highly recommend the gg sign or any sign)
-7. Press your hotkey
-8. Spam jump while holding "w"
-9. Enjoy the speed glitch ;)
+2. Bind your hotkey
+3. Go in MM2 and find a pool (usally in summer updates)
+4. hold "w" while facing the pool floor
+5. Press your hotkey
+6. Enjoy the pool super jump macro ;)
+
+
+HOW TO USE EQUIP ITEMS MACRO
+Steps:
+1. Enable the macro in the Equip items page
+2. Click new to add a new config
+3. Enter a name for the config
+4. Check how many menus you have on your emotes in mm2 and enter the the amount in "Menus"
+5. Check the menu number and slot number for each of the toys you want to equip then add them in the macro
+6. Bind your hotkey
+7. Click save
+8. Go in MM2, open the emotes and make sure you're on the first menu in the emote section then close the emote menu
+9. Press your hotkey
+10. Your items will now equip automaticly then go back to the first menu
+11. Enjoy the equip items macro ;)
+
+
+HOW TO USE THE LAG SWITCH MACRO
+Steps: 
+1. Enable the macro in the Lag switch page
+2. Bind your hotkey
+3. Go in mm2
+4. Press your hotkey
+5. Enjoy the lag switch macro ;)
