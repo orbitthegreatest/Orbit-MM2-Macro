@@ -1,3 +1,4 @@
 1 ICON "mm2_macro_logo.ico"
+1 24 "app.manifest"
 WINDIVERT_DLL BINARY "WinDivert.dll"
 WINDIVERT_SYS BINARY "WinDivert64.sys"

@@ -3,6 +3,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0600
+#define _WIN32_IE 0x0600
 #include <winsock2.h>
 #include <windows.h>
 #include <mmsystem.h>
@@ -111,10 +112,7 @@ static std::atomic<bool> g_spamActive{false};
 
 // Global stop/restart key state. The "was" flags are only touched from the
 // hook thread, so plain bools are fine here.
-static std::atomic<bool> g_stoppedByKey{false};
-static bool g_wasGlitchOn = false;
-static bool g_wasSpamOn = false;
-static bool g_wasLagOn = false;
+static std::atomic<bool> g_keybindsLocked{false};
 
 // Lag-switch dynamic module state. Kept together so EnableLagSwitch/DisableLagSwitch
 // can operate against the resolved WinDivert pointers without touching globals elsewhere.
@@ -206,6 +204,7 @@ static void UpdateCheckWorker();
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK MacroEditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // ==============================
 //  Theme: dark palette matched to the app logo (black + red accent)
@@ -267,6 +266,8 @@ void EnableRoundedCorners(HWND hwnd) {
 
 // Applied to every child control after creation: sets the themed font and,
 // for ListView/Tab controls, switches on dark-mode visuals.
+static LRESULT CALLBACK DarkHeaderProc(HWND hdr, UINT msg, WPARAM wParam, LPARAM lParam,
+                                       UINT_PTR uIdSubclass, DWORD_PTR dwRefData);
 BOOL CALLBACK ThemeChildProc(HWND hwnd, LPARAM) {
     SendMessageA(hwnd, WM_SETFONT, (WPARAM)g_hFont, TRUE);
     char cls[64] = {0};
@@ -274,12 +275,19 @@ BOOL CALLBACK ThemeChildProc(HWND hwnd, LPARAM) {
     if (_stricmp(cls, WC_LISTVIEWA) == 0) {
         SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
         HWND hdr = ListView_GetHeader(hwnd);
-        if (hdr) SetWindowTheme(hdr, L"DarkMode_ItemsView", NULL);
+        if (hdr) {
+            SetWindowTheme(hdr, L"DarkMode_ItemsView", NULL);
+            SetWindowSubclass(hdr, DarkHeaderProc, 1, 0);
+        }
         ListView_SetBkColor(hwnd, COL_EDIT_BG);
         ListView_SetTextColor(hwnd, COL_TEXT);
         ListView_SetTextBkColor(hwnd, COL_EDIT_BG);
         DWORD ex = ListView_GetExtendedListViewStyle(hwnd);
         ListView_SetExtendedListViewStyle(hwnd, ex | LVS_EX_DOUBLEBUFFER | LVS_EX_FULLROWSELECT);
+    } else if (_stricmp(cls, WC_BUTTONA) == 0) {
+        // v6 themed buttons (checkboxes) ignore WM_CTLCOLORBTN; force the dark
+        // theme so the label text stays white on the dark background.
+        SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
     } else if (_stricmp(cls, WC_TABCONTROLA) == 0) {
         SetWindowTheme(hwnd, L"DarkMode_Explorer", NULL);
     }
@@ -289,26 +297,119 @@ void ApplyThemeToChildren(HWND hwnd) {
     EnumChildWindows(hwnd, ThemeChildProc, 0);
 }
 
-// Creates a subclassed balloon tooltip bound to a control. The user just hovers
-// the control and the tip appears; no per-message tracking needed.
-HWND CreateToolTip(HWND parent, HWND target, const char* text) {
-    HWND tip = CreateWindowExA(0, TOOLTIPS_CLASS, NULL,
-                               WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP | TTS_BALLOON,
-                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-                               parent, NULL, GetModuleHandle(NULL), NULL);
-    if (!tip) return NULL;
-    TOOLINFOA ti = {};
-    ti.cbSize = sizeof(ti);
-    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-    ti.hwnd = parent;
-    ti.uId = (UINT_PTR)target;
-    ti.hinst = GetModuleHandle(NULL);
-    ti.lpszText = (LPSTR)text;
-    RECT rc; GetClientRect(target, &rc);
-    ti.rect = rc;
-    SendMessageA(tip, TTM_ADDTOOL, 0, (LPARAM)&ti);
-    SendMessageA(tip, TTM_SETMAXTIPWIDTH, 0, 320); // allow multi-line wrapping
-    return tip;
+// Paints the ListView column headers manually (dark background + white text)
+// so they never depend on OS theme support. Subclassed onto each header.
+static LRESULT CALLBACK DarkHeaderProc(HWND hdr, UINT msg, WPARAM wParam, LPARAM lParam,
+                                       UINT_PTR uIdSubclass, DWORD_PTR) {
+    switch (msg) {
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(hdr, DarkHeaderProc, uIdSubclass);
+            break;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hdr, &ps);
+            RECT rc; GetClientRect(hdr, &rc);
+            FillRect(dc, &rc, g_hbrBg);
+            int count = Header_GetItemCount(hdr);
+            for (int i = 0; i < count; ++i) {
+                RECT itemRc;
+                if (!Header_GetItemRect(hdr, i, &itemRc)) continue;
+                if (i > 0) {
+                    HBRUSH br = CreateSolidBrush(COL_ACCENT);
+                    RECT sep = {itemRc.left, itemRc.top, itemRc.left + 1, itemRc.bottom};
+                    FillRect(dc, &sep, br);
+                    DeleteObject(br);
+                }
+                char buf[128];
+                HDITEM hdi = {};
+                hdi.mask = HDI_TEXT;
+                hdi.pszText = buf;
+                hdi.cchTextMax = 128;
+                Header_GetItem(hdr, i, &hdi);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, COL_TEXT);
+                HFONT old = (HFONT)SelectObject(dc, g_hFont);
+                RECT tr = itemRc;
+                tr.left += 6;
+                DrawTextA(dc, buf, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                SelectObject(dc, old);
+            }
+            EndPaint(hdr, &ps);
+            return 0;
+        }
+    }
+    return DefSubclassProc(hdr, msg, wParam, lParam);
+}
+
+// ==============================
+//  Press feedback toast: a small topmost popup next to the cursor that shows
+//  "Macros stopped" / "Macros started" when the global stop/start key is pressed.
+// ==============================
+static HWND g_hintPopup = nullptr;
+static bool g_hintShown = false;
+static std::string g_hintText;
+static const UINT HINT_TIMER_ID = 1;
+static const int HINT_TIMEOUT_MS = 1800;
+
+static void ShowHint(const char* text) {
+    if (!g_hintPopup) return;
+    g_hintText = text;
+    POINT pt; GetCursorPos(&pt);
+    HDC dc = GetDC(g_hintPopup);
+    HFONT oldFont = (HFONT)SelectObject(dc, g_hFont);
+    RECT rc = {0, 0, 300, 0};
+    DrawTextA(dc, text, -1, &rc, DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL);
+    SelectObject(dc, oldFont);
+    ReleaseDC(g_hintPopup, dc);
+    int w = rc.right + 20, h = rc.bottom + 14;
+    int x = pt.x + 14, y = pt.y + 22;
+    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    if (x + w > sw - 8) x = pt.x - w - 14;
+    if (y + h > sh - 8) y = pt.y - h - 22;
+    if (x < 8) x = 8;
+    if (y < 8) y = 8;
+    SetWindowPos(g_hintPopup, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+    ShowWindow(g_hintPopup, SW_SHOWNOACTIVATE);
+    g_hintShown = true;
+    InvalidateRect(g_hintPopup, NULL, TRUE);
+    if (g_hwndMain) {
+        KillTimer(g_hwndMain, HINT_TIMER_ID);
+        SetTimer(g_hwndMain, HINT_TIMER_ID, HINT_TIMEOUT_MS, NULL);
+    }
+}
+
+static void HideHint() {
+    if (g_hintPopup && g_hintShown) {
+        ShowWindow(g_hintPopup, SW_HIDE);
+        g_hintShown = false;
+    }
+}
+
+LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            RECT rc; GetClientRect(hwnd, &rc);
+            FillRect(dc, &rc, g_hbrBg);
+            HBRUSH br = CreateSolidBrush(COL_ACCENT);
+            FrameRect(dc, &rc, br);
+            DeleteObject(br);
+            RECT tr = {10, 7, rc.right - 10, rc.bottom - 7};
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, COL_TEXT);
+            HFONT oldFont = (HFONT)SelectObject(dc, g_hFont);
+            DrawTextA(dc, g_hintText.c_str(), -1, &tr, DT_WORDBREAK | DT_LEFT | DT_NOPREFIX);
+            SelectObject(dc, oldFont);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 // Owner-draw renderer shared by every flat accent push-button in the app
@@ -823,6 +924,7 @@ void OnHotkey(UINT vk, bool down) {
             g_glitchActive = true;
             HoldW(true);
             std::thread(SpeedGlitchWorker).detach();
+            ShowHint("Speed Glitch started");
             if (g_statusLabelGlitch) SetWindowTextA(g_statusLabelGlitch, "Glitch: Running");
         } else if (!down && g_glitchActive) {
             g_glitchActive = false;
@@ -840,6 +942,7 @@ void OnHotkey(UINT vk, bool down) {
             g_glitchActive = true;
             HoldW(true);
             std::thread(SpeedGlitchWorker).detach();
+            ShowHint("Speed Glitch started");
             if (g_statusLabelGlitch) SetWindowTextA(g_statusLabelGlitch, "Glitch: Running");
         }
     }
@@ -871,6 +974,7 @@ void OnSpamHotkey(UINT vk, bool down) {
         if (down && !g_spamActive) {
             g_spamActive = true;
             std::thread(SpamSignWorker).detach();
+            ShowHint("Spam Sign started");
             if (g_statusLabelSpam) SetWindowTextA(g_statusLabelSpam, "Spam: Running");
         } else if (!down && g_spamActive) {
             g_spamActive = false;
@@ -884,6 +988,7 @@ void OnSpamHotkey(UINT vk, bool down) {
         } else {
             g_spamActive = true;
             std::thread(SpamSignWorker).detach();
+            ShowHint("Spam Sign started");
             if (g_statusLabelSpam) SetWindowTextA(g_statusLabelSpam, "Spam: Running");
         }
     }
@@ -924,52 +1029,35 @@ void OnMacroHotkey(UINT vk) {
         if (pair.second.hotkey == vk && vk != 0) {
             Macro m = pair.second; // copy — the map may change on the GUI thread
             std::thread([m]() { RunMacro(m); }).detach();
+            ShowHint((pair.second.name + " started").c_str());
             break;
         }
     }
 }
 
 // ==============================
-//  Global stop / restart key
-//  First press: stops every running macro (speed glitch, spam sign, lag switch).
-//  Second press: restarts exactly the ones that were stopped. Works globally,
-//  regardless of whether Roblox is focused.
+//  Global keybind lock key
+//  First press: locks every macro keybind (and stops whatever is currently
+//  running: speed glitch, spam sign, lag switch). While locked, pressing the
+//  macro keys does nothing. Second press: unlocks the keybinds again. Works
+//  globally, regardless of whether Roblox is focused.
 // ==============================
 void OnStopAllHotkey() {
-    bool glitchOn = g_glitchActive.load(std::memory_order_relaxed);
-    bool spamOn   = g_spamActive.load(std::memory_order_relaxed);
-    bool lagOn    = g_lagSwitchOn.load(std::memory_order_relaxed);
-
-    if (glitchOn || spamOn || lagOn) {
-        g_wasGlitchOn = glitchOn;
-        g_wasSpamOn   = spamOn;
-        g_wasLagOn    = lagOn;
-        g_glitchActive = false; HoldW(false);
-        g_spamActive   = false;
-        g_lagSwitchOn  = false;
-        g_stoppedByKey = true;
+    if (!g_keybindsLocked.load(std::memory_order_relaxed)) {
+        g_keybindsLocked = true;
+        bool glitchOn = g_glitchActive.load(std::memory_order_relaxed);
+        bool spamOn   = g_spamActive.load(std::memory_order_relaxed);
+        bool lagOn    = g_lagSwitchOn.load(std::memory_order_relaxed);
+        if (glitchOn) { g_glitchActive = false; HoldW(false); }
+        if (spamOn)   { g_spamActive = false; }
+        if (lagOn)    { g_lagSwitchOn = false; }
+        ShowHint("Macros stopped");
         if (g_statusLabelGlitch) SetWindowTextA(g_statusLabelGlitch, "Glitch: Stopped");
         if (g_statusLabelSpam)   SetWindowTextA(g_statusLabelSpam, "Spam: Stopped");
         if (g_statusLabelLag)    SetWindowTextA(g_statusLabelLag, "Lag: Off");
-    } else if (g_stoppedByKey) {
-        g_stoppedByKey = false;
-        if (g_wasGlitchOn) {
-            g_glitchActive = true; HoldW(true);
-            std::thread(SpeedGlitchWorker).detach();
-            if (g_statusLabelGlitch) SetWindowTextA(g_statusLabelGlitch, "Glitch: Running");
-        }
-        if (g_wasSpamOn) {
-            g_spamActive = true;
-            std::thread(SpamSignWorker).detach();
-            if (g_statusLabelSpam) SetWindowTextA(g_statusLabelSpam, "Spam: Running");
-        }
-        if (g_wasLagOn) {
-            if (g_lagAvailable.load(std::memory_order_relaxed)) {
-                g_lagSwitchOn = true;
-                std::thread(LagSwitchWorker).detach();
-                if (g_statusLabelLag) SetWindowTextA(g_statusLabelLag, "Lag: On");
-            }
-        }
+    } else {
+        g_keybindsLocked = false;
+        ShowHint("Macros started");
     }
 }
 
@@ -1153,6 +1241,7 @@ void OnLagHotkey(UINT vk, bool down) {
             }
             g_lagSwitchOn = true;
             std::thread(LagSwitchWorker).detach();
+            ShowHint("Lag Switch on");
             if (g_statusLabelLag) SetWindowTextA(g_statusLabelLag, "Lag: On");
         }
     }).detach();
@@ -1171,17 +1260,36 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     !(p->flags & LLKHF_INJECTED);
         if (down || up) {
             UINT vk = p->vkCode;
-            if (down && vk == g_config.stopAllKey && g_config.stopAllKey) OnStopAllHotkey();
-            else if (vk == g_config.glitchKey && g_config.glitchKey)      OnHotkey(vk, down);
-            else if (vk == g_config.lagKey && g_config.lagKey)         OnLagHotkey(vk, down);
-            else if (vk == g_config.spamKey && g_config.spamKey)       OnSpamHotkey(vk, down);
-            else if (down) {
-                if (vk == g_config.sitKey && g_config.sitKey)          OnSitHotkey(vk);
-                else if (vk == g_config.superJumpKey && g_config.superJumpKey) OnSuperJumpHotkey(vk);
-                else {
-                    for (auto& pair : g_macros)
-                        if (pair.second.hotkey == vk) { OnMacroHotkey(vk); break; }
+            // Normalize left/right modifier codes so recorded generic codes
+            // (VK_SHIFT / VK_CONTROL / VK_MENU / VK_LWIN) match physical presses.
+            if (vk == VK_LSHIFT || vk == VK_RSHIFT) vk = VK_SHIFT;
+            else if (vk == VK_LCONTROL || vk == VK_RCONTROL) vk = VK_CONTROL;
+            else if (vk == VK_LMENU || vk == VK_RMENU) vk = VK_MENU;
+            else if (vk == VK_LWIN || vk == VK_RWIN) vk = VK_LWIN;
+            // Fire only on press/release transitions (auto-repeat of a held key
+            // must not re-trigger a toggle).
+            static bool keyDown[256] = {false};
+            if (down) {
+                if (!keyDown[vk]) {
+                    keyDown[vk] = true;
+                    if (vk == g_config.stopAllKey && g_config.stopAllKey) OnStopAllHotkey();
+                    else if (g_keybindsLocked.load(std::memory_order_relaxed)) { /* keybinds locked */ }
+                    else if (vk == g_config.glitchKey && g_config.glitchKey) OnHotkey(vk, true);
+                    else if (vk == g_config.lagKey && g_config.lagKey) OnLagHotkey(vk, true);
+                    else if (vk == g_config.spamKey && g_config.spamKey) OnSpamHotkey(vk, true);
+                    else if (vk == g_config.sitKey && g_config.sitKey) OnSitHotkey(vk);
+                    else if (vk == g_config.superJumpKey && g_config.superJumpKey) OnSuperJumpHotkey(vk);
+                    else {
+                        for (auto& pair : g_macros)
+                            if (pair.second.hotkey == vk) { OnMacroHotkey(vk); break; }
+                    }
                 }
+            } else {
+                keyDown[vk] = false;
+                if (g_keybindsLocked.load(std::memory_order_relaxed)) { /* keybinds locked */ }
+                else if (vk == g_config.glitchKey && g_config.glitchKey) OnHotkey(vk, false);
+                else if (vk == g_config.lagKey && g_config.lagKey) OnLagHotkey(vk, false);
+                else if (vk == g_config.spamKey && g_config.spamKey) OnSpamHotkey(vk, false);
             }
         }
     }
@@ -1193,7 +1301,7 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         MSLLHOOKSTRUCT* p = (MSLLHOOKSTRUCT*)lParam;
         UINT vk = 0; bool down = false; bool up = false;
         switch (wParam) {
-            case WM_LBUTTONDOWN: vk = VK_LBUTTON; down = true; break;
+        case WM_LBUTTONDOWN: vk = VK_LBUTTON; down = true; break;
             case WM_LBUTTONUP:   vk = VK_LBUTTON; up = true; break;
             case WM_RBUTTONDOWN: vk = VK_RBUTTON; down = true; break;
             case WM_RBUTTONUP:   vk = VK_RBUTTON; up = true; break;
@@ -1205,7 +1313,8 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (vk) {
             if (down && vk == g_config.stopAllKey && g_config.stopAllKey) {
                 OnStopAllHotkey();
-            } else if (vk == g_config.glitchKey && g_config.glitchKey) {
+            } else if (g_keybindsLocked.load(std::memory_order_relaxed)) { /* keybinds locked */ }
+            else if (vk == g_config.glitchKey && g_config.glitchKey) {
                 if (down || up) OnHotkey(vk, down);
             } else if (vk == g_config.lagKey && g_config.lagKey) {
                 if (down || up) OnLagHotkey(vk, down);
@@ -1742,14 +1851,6 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowExA(0, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_UPPERCASE, 150, 223, 80, 24, hwnd, (HMENU)601, GetModuleHandle(NULL), NULL);
             CreateWindowExA(0, "BUTTON", "Record", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 240, 223, 70, 24, hwnd, (HMENU)602, GetModuleHandle(NULL), NULL);
             g_statusLabelUpdate = CreateWindowExA(0, "STATIC", "Update: checking...", WS_CHILD | WS_VISIBLE, 36, 266, 400, 20, hwnd, (HMENU)603, GetModuleHandle(NULL), NULL);
-
-            // Tooltip explaining the global stop/restart-all key.
-            const char* stopAllTip = "Global Stop/Start key: press it to stop every running macro "
-                                     "(speed glitch, spam sign, lag switch) at once - even outside "
-                                     "Roblox. Press it again to restart exactly the macros that were running.";
-            CreateToolTip(hwnd, GetDlgItem(hwnd, 1103), stopAllTip);
-            CreateToolTip(hwnd, GetDlgItem(hwnd, 601), stopAllTip);
-            CreateToolTip(hwnd, GetDlgItem(hwnd, 602), stopAllTip);
 
             // --- Tab 1: Speed Glitch ---
             CreateWindowExA(0, "BUTTON", "Hold Mode", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 36, 106, 150, 25, hwnd, (HMENU)112, GetModuleHandle(NULL), NULL);
@@ -2401,6 +2502,9 @@ g_hwndSettings = CreateWindowExA(0, "SettingsClass", "Orbit MM2 Settings",
         case WM_DESTROY:
             PostQuitMessage(0);
             break;
+        case WM_TIMER:
+            if (wParam == HINT_TIMER_ID) HideHint();
+            break;
         default:
             return DefWindowProc(hwnd, msg, wParam, lParam);
     }
@@ -2438,7 +2542,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     InitThemeResources();
 
     // Register the common controls classes (tooltips) before creating windows.
-    INITCOMMONCONTROLSEX icc = { sizeof(INITCOMMONCONTROLSEX), ICC_BAR_CLASSES };
+    INITCOMMONCONTROLSEX icc = { sizeof(INITCOMMONCONTROLSEX), ICC_WIN95_CLASSES };
     InitCommonControlsEx(&icc);
 
     // Load icon from resource (used for the tray icon, all window title bars, and the header banner)
@@ -2481,11 +2585,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     wcMacroEdit.style = CS_DROPSHADOW;
     RegisterClassA(&wcMacroEdit);
 
+    WNDCLASSA wcHint = {};
+    wcHint.lpfnWndProc = HintWndProc;
+    wcHint.hInstance = hInstance;
+    wcHint.lpszClassName = "HintClass";
+    wcHint.hbrBackground = g_hbrBg;
+    RegisterClassA(&wcHint);
+
     g_hwndMain = CreateWindowExA(0, "OrbitMM2Class", "Orbit MM2 Macro",
                                  WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                                  400, 200, NULL, NULL, hInstance, NULL);
     if (!g_hwndMain) return 1;
     ShowWindow(g_hwndMain, SW_HIDE);
+
+    // Press feedback toast popup (shown next to the cursor when the global
+    // stop/start key is pressed).
+    g_hintPopup = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                  "HintClass", NULL, WS_POPUP, 0, 0, 200, 60,
+                                  NULL, NULL, hInstance, NULL);
 
     g_keyboardHook = SetWindowsHookExA(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
     g_mouseHook = SetWindowsHookExA(WH_MOUSE_LL, LowLevelMouseProc, hInstance, 0);
@@ -2515,6 +2632,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
     if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    if (g_hintPopup) {
+        KillTimer(g_hwndMain, HINT_TIMER_ID);
+        DestroyWindow(g_hintPopup);
+        g_hintPopup = nullptr;
+    }
     timeEndPeriod(1);
     if (g_singleInstanceMutex) {
         ReleaseMutex(g_singleInstanceMutex);
