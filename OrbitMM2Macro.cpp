@@ -103,6 +103,7 @@ static HANDLE g_singleInstanceMutex = NULL;
 static bool g_exitRequested = false;
 static bool g_recording = false;
 static int g_recordingTarget = 0; // 0=glitch, 1=sit, 2=superjump, 3=lag
+static UINT g_captureKey = 0;     // key captured by the low-level hook while recording
 
 static Macro g_editingMacro;
 static bool g_editingNew = true;
@@ -1266,6 +1267,13 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             else if (vk == VK_LCONTROL || vk == VK_RCONTROL) vk = VK_CONTROL;
             else if (vk == VK_LMENU || vk == VK_RMENU) vk = VK_MENU;
             else if (vk == VK_LWIN || vk == VK_RWIN) vk = VK_LWIN;
+            // While recording, capture the ACTUAL key press from the hook. If
+            // Alt is physically down (e.g. AltGr keyboards report Ctrl+Alt),
+            // record Alt so a plain Ctrl press can never hijack the binding.
+            if (g_recording && down) {
+                g_captureKey = (GetAsyncKeyState(VK_MENU) & 0x8000) ? VK_MENU : vk;
+            }
+            if (g_recording) return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
             // Fire only on press/release transitions (auto-repeat of a held key
             // must not re-trigger a toggle).
             static bool keyDown[256] = {false};
@@ -1311,6 +1319,9 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             case WM_XBUTTONUP:   vk = (HIWORD(p->mouseData) & XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2; up = true; break;
         }
         if (vk) {
+            // While recording, capture the actual mouse button from the hook.
+            if (g_recording && down) g_captureKey = vk;
+            if (g_recording) return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
             if (down && vk == g_config.stopAllKey && g_config.stopAllKey) {
                 OnStopAllHotkey();
             } else if (g_keybindsLocked.load(std::memory_order_relaxed)) { /* keybinds locked */ }
@@ -1665,10 +1676,13 @@ std::string KeyName(UINT vk) {
         case VK_F12:     return "F12";
         case VK_LSHIFT:  return "LShift";
         case VK_RSHIFT:  return "RShift";
+        case VK_SHIFT:   return "Shift";
         case VK_LCONTROL:return "LCtrl";
         case VK_RCONTROL:return "RCtrl";
+        case VK_CONTROL: return "Ctrl";
         case VK_LMENU:   return "LAlt";
         case VK_RMENU:   return "RAlt";
+        case VK_MENU:    return "Alt";
         case VK_LWIN:    return "LWin";
         case VK_RWIN:    return "RWin";
         case VK_NUMPAD0: return "Numpad0";
@@ -1709,87 +1723,47 @@ std::string KeyName(UINT vk) {
 // ==============================
 void CALLBACK RecordTimerProc(HWND hwnd, UINT, UINT_PTR, DWORD) {
     if (!g_recording) return;
-    for (int vk = 1; vk <= 255; ++vk) {
-        if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON ||
-            vk == VK_XBUTTON1 || vk == VK_XBUTTON2) continue;
-        if (GetAsyncKeyState(vk) & 0x8000) {
-            g_recording = false; KillTimer(hwnd, 1);
-            UINT key = (UINT)vk;
-            std::string name = KeyName(key);
-            if (g_recordingTarget == 0) {
-                g_config.glitchKey = key;
-                SetDlgItemTextA(hwnd, 113, name.c_str());
-                EnableWindow(GetDlgItem(hwnd, 114), TRUE);
-                SetDlgItemTextA(hwnd, 114, "Record");
-            } else if (g_recordingTarget == 1) {
-                g_config.sitKey = key;
-                SetDlgItemTextA(hwnd, 202, name.c_str());
-                EnableWindow(GetDlgItem(hwnd, 203), TRUE);
-                SetDlgItemTextA(hwnd, 203, "Record");
-            } else if (g_recordingTarget == 2) {
-                g_config.superJumpKey = key;
-                SetDlgItemTextA(hwnd, 302, name.c_str());
-                EnableWindow(GetDlgItem(hwnd, 303), TRUE);
-                SetDlgItemTextA(hwnd, 303, "Record");
-            } else if (g_recordingTarget == 3) {
-                g_config.lagKey = key;
-                SetDlgItemTextA(hwnd, 413, name.c_str());
-                EnableWindow(GetDlgItem(hwnd, 414), TRUE);
-                SetDlgItemTextA(hwnd, 414, "Record");
-            } else if (g_recordingTarget == 4) {
-                g_config.spamKey = key;
-                SetDlgItemTextA(hwnd, 513, name.c_str());
-                EnableWindow(GetDlgItem(hwnd, 514), TRUE);
-                SetDlgItemTextA(hwnd, 514, "Record");
-            } else if (g_recordingTarget == 5) {
-                g_config.stopAllKey = key;
-                SetDlgItemTextA(hwnd, 601, name.c_str());
-                EnableWindow(GetDlgItem(hwnd, 602), TRUE);
-                SetDlgItemTextA(hwnd, 602, "Record");
-            }
-            return;
-        }
-    }
+    UINT key = g_captureKey;
+    if (key == 0) return;
+    g_captureKey = 0;
+    g_recording = false; KillTimer(hwnd, 1);
     UINT mouseKeys[] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
     const char* mouseNames[] = {"LButton","RButton","MButton","XButton1","XButton2"};
+    std::string name;
     for (int i = 0; i < 5; ++i) {
-        if (GetAsyncKeyState(mouseKeys[i]) & 0x8000) {
-            g_recording = false; KillTimer(hwnd, 1);
-            UINT key = mouseKeys[i];
-            const char* name = mouseNames[i];
-            if (g_recordingTarget == 0) {
-                g_config.glitchKey = key;
-                SetDlgItemTextA(hwnd, 113, name);
-                EnableWindow(GetDlgItem(hwnd, 114), TRUE);
-                SetDlgItemTextA(hwnd, 114, "Record");
-            } else if (g_recordingTarget == 1) {
-                g_config.sitKey = key;
-                SetDlgItemTextA(hwnd, 202, name);
-                EnableWindow(GetDlgItem(hwnd, 203), TRUE);
-                SetDlgItemTextA(hwnd, 203, "Record");
-            } else if (g_recordingTarget == 2) {
-                g_config.superJumpKey = key;
-                SetDlgItemTextA(hwnd, 302, name);
-                EnableWindow(GetDlgItem(hwnd, 303), TRUE);
-                SetDlgItemTextA(hwnd, 303, "Record");
-            } else if (g_recordingTarget == 3) {
-                g_config.lagKey = key;
-                SetDlgItemTextA(hwnd, 413, name);
-                EnableWindow(GetDlgItem(hwnd, 414), TRUE);
-                SetDlgItemTextA(hwnd, 414, "Record");
-            } else if (g_recordingTarget == 4) {
-                g_config.spamKey = key;
-                SetDlgItemTextA(hwnd, 513, name);
-                EnableWindow(GetDlgItem(hwnd, 514), TRUE);
-                SetDlgItemTextA(hwnd, 514, "Record");
-            } else if (g_recordingTarget == 5) {
-                g_config.stopAllKey = key;
-                SetDlgItemTextA(hwnd, 601, name);
-                EnableWindow(GetDlgItem(hwnd, 602), TRUE);
-                SetDlgItemTextA(hwnd, 602, "Record");
-            }
-            return;
-        }
+        if (key == mouseKeys[i]) { name = mouseNames[i]; key = mouseKeys[i]; break; }
+    }
+    if (name.empty()) name = KeyName(key);
+    if (g_recordingTarget == 0) {
+        g_config.glitchKey = key;
+        SetDlgItemTextA(hwnd, 113, name.c_str());
+        EnableWindow(GetDlgItem(hwnd, 114), TRUE);
+        SetDlgItemTextA(hwnd, 114, "Record");
+    } else if (g_recordingTarget == 1) {
+        g_config.sitKey = key;
+        SetDlgItemTextA(hwnd, 202, name.c_str());
+        EnableWindow(GetDlgItem(hwnd, 203), TRUE);
+        SetDlgItemTextA(hwnd, 203, "Record");
+    } else if (g_recordingTarget == 2) {
+        g_config.superJumpKey = key;
+        SetDlgItemTextA(hwnd, 302, name.c_str());
+        EnableWindow(GetDlgItem(hwnd, 303), TRUE);
+        SetDlgItemTextA(hwnd, 303, "Record");
+    } else if (g_recordingTarget == 3) {
+        g_config.lagKey = key;
+        SetDlgItemTextA(hwnd, 413, name.c_str());
+        EnableWindow(GetDlgItem(hwnd, 414), TRUE);
+        SetDlgItemTextA(hwnd, 414, "Record");
+    } else if (g_recordingTarget == 4) {
+        g_config.spamKey = key;
+        SetDlgItemTextA(hwnd, 513, name.c_str());
+        EnableWindow(GetDlgItem(hwnd, 514), TRUE);
+        SetDlgItemTextA(hwnd, 514, "Record");
+    } else if (g_recordingTarget == 5) {
+        g_config.stopAllKey = key;
+        SetDlgItemTextA(hwnd, 601, name.c_str());
+        EnableWindow(GetDlgItem(hwnd, 602), TRUE);
+        SetDlgItemTextA(hwnd, 602, "Record");
     }
 }
 
@@ -2289,30 +2263,21 @@ LRESULT CALLBACK MacroEditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                         EnableWindow(GetDlgItem(hwnd, 203), FALSE);
                         SetTimer(hwnd, 2, 50, [](HWND h, UINT, UINT_PTR, DWORD) {
                             if (!g_recording) return;
-                            for (int vk=1; vk<=255; ++vk) {
-                                if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON ||
-                                    vk == VK_XBUTTON1 || vk == VK_XBUTTON2) continue;
-                                if (GetAsyncKeyState(vk) & 0x8000) {
-                                    g_recording = false; KillTimer(h, 2);
-                                    g_editingMacro.hotkey = (UINT)vk;
-                                    SetDlgItemTextA(h, 202, KeyName(vk).c_str());
-                                    EnableWindow(GetDlgItem(h, 203), TRUE);
-                                    SetDlgItemTextA(h, 203, "Rec");
-                                    return;
-                                }
-                            }
+                            UINT key = g_captureKey;
+                            if (key == 0) return;
+                            g_captureKey = 0;
+                            g_recording = false; KillTimer(h, 2);
                             UINT mouseKeys[] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
                             const char* names[] = {"LButton","RButton","MButton","XButton1","XButton2"};
+                            std::string name;
                             for (int i=0; i<5; ++i) {
-                                if (GetAsyncKeyState(mouseKeys[i]) & 0x8000) {
-                                    g_recording = false; KillTimer(h, 2);
-                                    g_editingMacro.hotkey = mouseKeys[i];
-                                    SetDlgItemTextA(h, 202, names[i]);
-                                    EnableWindow(GetDlgItem(h, 203), TRUE);
-                                    SetDlgItemTextA(h, 203, "Rec");
-                                    return;
-                                }
+                                if (key == mouseKeys[i]) { name = names[i]; break; }
                             }
+                            if (name.empty()) name = KeyName(key);
+                            g_editingMacro.hotkey = key;
+                            SetDlgItemTextA(h, 202, name.c_str());
+                            EnableWindow(GetDlgItem(h, 203), TRUE);
+                            SetDlgItemTextA(h, 203, "Rec");
                         });
                     }
                     break;
