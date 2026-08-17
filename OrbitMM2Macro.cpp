@@ -12,6 +12,7 @@
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <urlmon.h>
+#include <winhttp.h>
 #include <iphlpapi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,6 +109,13 @@ static std::map<std::string, Macro> g_macros;
 static std::atomic<bool> g_glitchActive{false};
 static std::atomic<bool> g_spamActive{false};
 
+// Global stop/restart key state. The "was" flags are only touched from the
+// hook thread, so plain bools are fine here.
+static std::atomic<bool> g_stoppedByKey{false};
+static bool g_wasGlitchOn = false;
+static bool g_wasSpamOn = false;
+static bool g_wasLagOn = false;
+
 // Lag-switch dynamic module state. Kept together so EnableLagSwitch/DisableLagSwitch
 // can operate against the resolved WinDivert pointers without touching globals elsewhere.
 static HMODULE g_winDivertDll = NULL;
@@ -124,6 +132,7 @@ static HWND g_statusLabelSit = nullptr;
 static HWND g_statusLabelJump = nullptr;
 static HWND g_statusLabelGlitch = nullptr;
 static HWND g_statusLabelSpam = nullptr;
+static HWND g_statusLabelUpdate = nullptr;
 
 struct Config {
     double sensitivity = 0.294;
@@ -155,7 +164,17 @@ struct Config {
     UINT spamKey = 0;         // personalisable - no default key until the user records one
     int spamSlot = 7;         // gear slot repeatedly equipped/released
     bool spamHoldMode = false; // checks "hold the trigger key while spam" like Spencer's toggle/hold
+
+    // Global stop-all key: first press stops every running macro, second press
+    // restarts exactly the ones that were running.
+    UINT stopAllKey = 0;      // no default key until the user records one
 } g_config;
+
+// ==============================
+//  Update detector (GitHub releases)
+// ==============================
+static const char* g_currentVersion = "1.6.0";
+static std::string g_lastNotifiedVersion;
 
 // Forward declarations
 void LoadConfig();
@@ -179,8 +198,10 @@ void RunMacro(const Macro& macro);
 void LoadMacros();
 void SaveMacros();
 std::string KeyName(UINT vk);
+void OnStopAllHotkey();
 static void LagSwitchWorker();
 static void EnsureLagAvailable();
+static void UpdateCheckWorker();
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -266,6 +287,28 @@ BOOL CALLBACK ThemeChildProc(HWND hwnd, LPARAM) {
 }
 void ApplyThemeToChildren(HWND hwnd) {
     EnumChildWindows(hwnd, ThemeChildProc, 0);
+}
+
+// Creates a subclassed balloon tooltip bound to a control. The user just hovers
+// the control and the tip appears; no per-message tracking needed.
+HWND CreateToolTip(HWND parent, HWND target, const char* text) {
+    HWND tip = CreateWindowExA(0, TOOLTIPS_CLASS, NULL,
+                               WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP | TTS_BALLOON,
+                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                               parent, NULL, GetModuleHandle(NULL), NULL);
+    if (!tip) return NULL;
+    TOOLINFOA ti = {};
+    ti.cbSize = sizeof(ti);
+    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd = parent;
+    ti.uId = (UINT_PTR)target;
+    ti.hinst = GetModuleHandle(NULL);
+    ti.lpszText = (LPSTR)text;
+    RECT rc; GetClientRect(target, &rc);
+    ti.rect = rc;
+    SendMessageA(tip, TTM_ADDTOOL, 0, (LPARAM)&ti);
+    SendMessageA(tip, TTM_SETMAXTIPWIDTH, 0, 320); // allow multi-line wrapping
+    return tip;
 }
 
 // Owner-draw renderer shared by every flat accent push-button in the app
@@ -449,6 +492,11 @@ void LoadConfig() {
     g_config.spamKey = (UINT)readInt("SpamSign", "TriggerKey", 0);
     g_config.spamSlot = readInt("SpamSign", "Slot", 7);
     g_config.spamHoldMode = readBool("SpamSign", "HoldMode", false);
+
+    g_config.stopAllKey = (UINT)readInt("General", "StopAllKey", 0);
+    char verBuf[64] = {0};
+    readString("Update", "LastNotifiedVersion", verBuf, sizeof(verBuf), "");
+    g_lastNotifiedVersion = verBuf;
 }
 
 void SaveConfig() {
@@ -477,6 +525,8 @@ void SaveConfig() {
     writeInt("SpamSign", "TriggerKey", g_config.spamKey);
     writeInt("SpamSign", "Slot", g_config.spamSlot);
     writeBool("SpamSign", "HoldMode", g_config.spamHoldMode);
+
+    writeInt("General", "StopAllKey", g_config.stopAllKey);
 }
 
 // ==============================
@@ -879,6 +929,201 @@ void OnMacroHotkey(UINT vk) {
     }
 }
 
+// ==============================
+//  Global stop / restart key
+//  First press: stops every running macro (speed glitch, spam sign, lag switch).
+//  Second press: restarts exactly the ones that were stopped. Works globally,
+//  regardless of whether Roblox is focused.
+// ==============================
+void OnStopAllHotkey() {
+    bool glitchOn = g_glitchActive.load(std::memory_order_relaxed);
+    bool spamOn   = g_spamActive.load(std::memory_order_relaxed);
+    bool lagOn    = g_lagSwitchOn.load(std::memory_order_relaxed);
+
+    if (glitchOn || spamOn || lagOn) {
+        g_wasGlitchOn = glitchOn;
+        g_wasSpamOn   = spamOn;
+        g_wasLagOn    = lagOn;
+        g_glitchActive = false; HoldW(false);
+        g_spamActive   = false;
+        g_lagSwitchOn  = false;
+        g_stoppedByKey = true;
+        if (g_statusLabelGlitch) SetWindowTextA(g_statusLabelGlitch, "Glitch: Stopped");
+        if (g_statusLabelSpam)   SetWindowTextA(g_statusLabelSpam, "Spam: Stopped");
+        if (g_statusLabelLag)    SetWindowTextA(g_statusLabelLag, "Lag: Off");
+    } else if (g_stoppedByKey) {
+        g_stoppedByKey = false;
+        if (g_wasGlitchOn) {
+            g_glitchActive = true; HoldW(true);
+            std::thread(SpeedGlitchWorker).detach();
+            if (g_statusLabelGlitch) SetWindowTextA(g_statusLabelGlitch, "Glitch: Running");
+        }
+        if (g_wasSpamOn) {
+            g_spamActive = true;
+            std::thread(SpamSignWorker).detach();
+            if (g_statusLabelSpam) SetWindowTextA(g_statusLabelSpam, "Spam: Running");
+        }
+        if (g_wasLagOn) {
+            if (g_lagAvailable.load(std::memory_order_relaxed)) {
+                g_lagSwitchOn = true;
+                std::thread(LagSwitchWorker).detach();
+                if (g_statusLabelLag) SetWindowTextA(g_statusLabelLag, "Lag: On");
+            }
+        }
+    }
+}
+
+// ==============================
+//  Update detector (GitHub releases)
+//  Polls https://api.github.com/repos/orbitthegreatest/Orbit-MM2-Macro/releases/latest
+//  and notifies when a tag newer than the current build is published. Each new
+//  version is only announced once (persisted in config.ini).
+// ==============================
+static int CompareVersions(const std::string& a, const std::string& b) {
+    auto split = [](const std::string& s) {
+        std::vector<int> v;
+        std::string cur;
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (isdigit((unsigned char)s[i])) cur += s[i];
+            else if (!cur.empty()) { v.push_back(atoi(cur.c_str())); cur.clear(); }
+        }
+        if (!cur.empty()) v.push_back(atoi(cur.c_str()));
+        return v;
+    };
+    std::vector<int> av = split(a), bv = split(b);
+    size_t n = std::max(av.size(), bv.size());
+    for (size_t i = 0; i < n; ++i) {
+        int x = i < av.size() ? av[i] : 0;
+        int y = i < bv.size() ? bv[i] : 0;
+        if (x != y) return x < y ? -1 : 1;
+    }
+    return 0;
+}
+
+static std::string ExtractTagName(const std::string& json) {
+    const char* key = "\"tag_name\"";
+    size_t pos = json.find(key);
+    if (pos == std::string::npos) return "";
+    pos += strlen(key);
+    size_t q1 = json.find('"', pos);
+    if (q1 == std::string::npos) return "";
+    size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return json.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// Fetches a HTTPS URL into a string via WinHTTP. A proper User-Agent is set
+// because the GitHub API rejects requests without one (HTTP 403).
+static bool HttpGetString(const char* url, std::string& out) {
+    out.clear();
+    HINTERNET hSession = WinHttpOpen(L"OrbitMM2Macro-Updater/1.0",
+                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    std::string host, path = "/";
+    const char* p = strstr(url, "://");
+    if (p) {
+        p += 3;
+        const char* slash = strchr(p, '/');
+        if (slash) { host.assign(p, slash - p); path.assign(slash); }
+        else host.assign(p);
+    } else {
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    std::wstring wHost(host.begin(), host.end());
+    std::wstring wPath(path.begin(), path.end());
+
+    bool ok = false;
+    HINTERNET hConnect = WinHttpConnect(hSession, wHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (hConnect) {
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", wPath.c_str(), NULL,
+                                                WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                WINHTTP_FLAG_SECURE);
+        if (hRequest) {
+            if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(hRequest, NULL)) {
+                char buf[4096];
+                DWORD read = 0;
+                do {
+                    if (!WinHttpReadData(hRequest, buf, sizeof(buf), &read)) { read = 0; break; }
+                    if (read > 0) out.append(buf, read);
+                } while (read > 0);
+                ok = true;
+            }
+            WinHttpCloseHandle(hRequest);
+        }
+        WinHttpCloseHandle(hConnect);
+    }
+    WinHttpCloseHandle(hSession);
+    return ok;
+}
+
+static void SetUpdateStatusText(const std::string& text) {
+    if (g_hwndSettings && g_statusLabelUpdate)
+        SetWindowTextA(g_statusLabelUpdate, text.c_str());
+}
+
+static void NotifyUpdateAvailable(const std::string& tag) {
+    // Tray balloon (shown as a toast on Win10/11); clicking it opens the release page.
+    wcscpy_s(g_nid.szInfoTitle, L"Orbit MM2 Macro - Update Available");
+    std::wstring msg = L"Version " + std::wstring(tag.begin(), tag.end()) +
+                       L" is now available. Click to download.";
+    wcscpy_s(g_nid.szInfo, msg.c_str());
+    g_nid.uFlags = NIF_INFO;
+    g_nid.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+
+    // Inline prompt to grab the new release right away.
+    if (MessageBoxA(NULL, ("A new version (" + tag + ") of Orbit MM2 Macro is available!\n\n"
+                           "Download it now?").c_str(), "Orbit MM2 Macro - Update",
+                    MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+        ShellExecuteA(NULL, "open",
+                      "https://github.com/orbitthegreatest/Orbit-MM2-Macro/releases/latest",
+                      NULL, NULL, SW_SHOWNORMAL);
+    }
+    SetUpdateStatusText("Update: " + tag + " available!");
+}
+
+static void UpdateCheckWorker() {
+    const char* apiUrl = "https://api.github.com/repos/orbitthegreatest/Orbit-MM2-Macro/releases/latest";
+    Sleep(3000); // give the network stack a moment after launch
+
+    while (!g_exitRequested) {
+        std::string json;
+        if (HttpGetString(apiUrl, json)) {
+            std::string tag = ExtractTagName(json);
+            if (!tag.empty()) {
+                std::string latest = tag;
+                if (latest[0] == 'v' || latest[0] == 'V') latest = latest.substr(1);
+                std::string cur = g_currentVersion;
+                if (cur[0] == 'v' || cur[0] == 'V') cur = cur.substr(1);
+                std::string lastNotified = g_lastNotifiedVersion;
+                if (lastNotified[0] == 'v' || lastNotified[0] == 'V') lastNotified = lastNotified.substr(1);
+
+                if (CompareVersions(latest, cur) > 0 && CompareVersions(latest, lastNotified) > 0) {
+                    g_lastNotifiedVersion = tag;
+                    writeString("Update", "LastNotifiedVersion", tag.c_str());
+                    NotifyUpdateAvailable(tag);
+                } else {
+                    SetUpdateStatusText("Update: up to date (v" + cur + ")");
+                }
+            } else {
+                SetUpdateStatusText("Update: no release found");
+            }
+        } else {
+            SetUpdateStatusText("Update: check failed (offline?)");
+        }
+
+        // Re-check every 30 minutes.
+        for (int i = 0; i < 30 * 60 && !g_exitRequested; ++i) Sleep(1000);
+    }
+}
+
 // Lag switch uses hold-mode (while the key is held Roblox UDP is blocked; release
 // to resume normal traffic). This matches the Spencer screenshots where "Switch
 // from Hold Key to Toggle Key" was checked — but re-reading that checkbox name,
@@ -926,7 +1171,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     !(p->flags & LLKHF_INJECTED);
         if (down || up) {
             UINT vk = p->vkCode;
-            if (vk == g_config.glitchKey && g_config.glitchKey)        OnHotkey(vk, down);
+            if (down && vk == g_config.stopAllKey && g_config.stopAllKey) OnStopAllHotkey();
+            else if (vk == g_config.glitchKey && g_config.glitchKey)      OnHotkey(vk, down);
             else if (vk == g_config.lagKey && g_config.lagKey)         OnLagHotkey(vk, down);
             else if (vk == g_config.spamKey && g_config.spamKey)       OnSpamHotkey(vk, down);
             else if (down) {
@@ -957,7 +1203,9 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             case WM_XBUTTONUP:   vk = (HIWORD(p->mouseData) & XBUTTON1) ? VK_XBUTTON1 : VK_XBUTTON2; up = true; break;
         }
         if (vk) {
-            if (vk == g_config.glitchKey && g_config.glitchKey) {
+            if (down && vk == g_config.stopAllKey && g_config.stopAllKey) {
+                OnStopAllHotkey();
+            } else if (vk == g_config.glitchKey && g_config.glitchKey) {
                 if (down || up) OnHotkey(vk, down);
             } else if (vk == g_config.lagKey && g_config.lagKey) {
                 if (down || up) OnLagHotkey(vk, down);
@@ -1384,6 +1632,11 @@ void CALLBACK RecordTimerProc(HWND hwnd, UINT, UINT_PTR, DWORD) {
                 SetDlgItemTextA(hwnd, 513, name.c_str());
                 EnableWindow(GetDlgItem(hwnd, 514), TRUE);
                 SetDlgItemTextA(hwnd, 514, "Record");
+            } else if (g_recordingTarget == 5) {
+                g_config.stopAllKey = key;
+                SetDlgItemTextA(hwnd, 601, name.c_str());
+                EnableWindow(GetDlgItem(hwnd, 602), TRUE);
+                SetDlgItemTextA(hwnd, 602, "Record");
             }
             return;
         }
@@ -1420,6 +1673,11 @@ void CALLBACK RecordTimerProc(HWND hwnd, UINT, UINT_PTR, DWORD) {
                 SetDlgItemTextA(hwnd, 513, name);
                 EnableWindow(GetDlgItem(hwnd, 514), TRUE);
                 SetDlgItemTextA(hwnd, 514, "Record");
+            } else if (g_recordingTarget == 5) {
+                g_config.stopAllKey = key;
+                SetDlgItemTextA(hwnd, 601, name);
+                EnableWindow(GetDlgItem(hwnd, 602), TRUE);
+                SetDlgItemTextA(hwnd, 602, "Record");
             }
             return;
         }
@@ -1478,6 +1736,20 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             CreateWindowExA(0, "STATIC", "Roblox FPS:", WS_CHILD | WS_VISIBLE, 36, 146, 160, 20, hwnd, (HMENU)1102, GetModuleHandle(NULL), NULL);
             CreateWindowExA(0, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER, 210, 143, 90, 24, hwnd, (HMENU)111, GetModuleHandle(NULL), NULL);
             CreateWindowExA(0, "BUTTON", "Start Minimized", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 36, 186, 200, 25, hwnd, (HMENU)501, GetModuleHandle(NULL), NULL);
+
+            // Global stop/restart-all key + update status live on the Main tab too.
+            CreateWindowExA(0, "STATIC", "Stop All Key:", WS_CHILD | WS_VISIBLE, 36, 226, 100, 20, hwnd, (HMENU)1103, GetModuleHandle(NULL), NULL);
+            CreateWindowExA(0, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_UPPERCASE, 150, 223, 80, 24, hwnd, (HMENU)601, GetModuleHandle(NULL), NULL);
+            CreateWindowExA(0, "BUTTON", "Record", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 240, 223, 70, 24, hwnd, (HMENU)602, GetModuleHandle(NULL), NULL);
+            g_statusLabelUpdate = CreateWindowExA(0, "STATIC", "Update: checking...", WS_CHILD | WS_VISIBLE, 36, 266, 400, 20, hwnd, (HMENU)603, GetModuleHandle(NULL), NULL);
+
+            // Tooltip explaining the global stop/restart-all key.
+            const char* stopAllTip = "Global Stop/Start key: press it to stop every running macro "
+                                     "(speed glitch, spam sign, lag switch) at once - even outside "
+                                     "Roblox. Press it again to restart exactly the macros that were running.";
+            CreateToolTip(hwnd, GetDlgItem(hwnd, 1103), stopAllTip);
+            CreateToolTip(hwnd, GetDlgItem(hwnd, 601), stopAllTip);
+            CreateToolTip(hwnd, GetDlgItem(hwnd, 602), stopAllTip);
 
             // --- Tab 1: Speed Glitch ---
             CreateWindowExA(0, "BUTTON", "Hold Mode", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 36, 106, 150, 25, hwnd, (HMENU)112, GetModuleHandle(NULL), NULL);
@@ -1566,6 +1838,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             sprintf_s(buf, "%f", g_config.sensitivity); SetDlgItemTextA(hwnd, 110, buf);
             sprintf_s(buf, "%d", g_config.fps); SetDlgItemTextA(hwnd, 111, buf);
             CheckDlgButton(hwnd, 501, g_config.startMinimized ? BST_CHECKED : BST_UNCHECKED);
+            SetDlgItemTextA(hwnd, 601, KeyName(g_config.stopAllKey).c_str());
 
             CheckDlgButton(hwnd, 112, g_config.holdMode ? BST_CHECKED : BST_UNCHECKED);
             SetDlgItemTextA(hwnd, 113, KeyName(g_config.glitchKey).c_str());
@@ -1589,7 +1862,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             CheckDlgButton(hwnd, 517, g_config.spamEnabled ? BST_CHECKED : BST_UNCHECKED);
 
             // Show only Main
-            int allIds[] = {110,111,501,1101,1102,
+int allIds[] = {110,111,501,601,602,603,1101,1102,1103,
                             112,113,114,115,116,1104,
                             202,203,204,205,206,1201,1202,
                             302,303,306,308,1301,
@@ -1597,7 +1870,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                                 413,414,415,416,1401,
                                 513,514,515,516,517,518,1601,1602};
             for (int id : allIds) ShowWindow(GetDlgItem(hwnd, id), SW_HIDE);
-            for (int id : {110,111,501,1101,1102}) ShowWindow(GetDlgItem(hwnd, id), SW_SHOW);
+            for (int id : {110,111,501,601,602,603,1101,1102,1103}) ShowWindow(GetDlgItem(hwnd, id), SW_SHOW);
 
             ApplyThemeToChildren(hwnd);
             SendMessageA(hwnd, WM_SETFONT, (WPARAM)g_hFont, TRUE);
@@ -1647,7 +1920,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             NMHDR* hdr = (NMHDR*)lParam;
             if (hdr->idFrom == 100 && hdr->code == TCN_SELCHANGE) {
                 int tab = TabCtrl_GetCurSel(hTab);
-int allIds[] = {110,111,501,1101,1102,
+int allIds[] = {110,111,501,601,602,603,1101,1102,1103,
                                 112,113,114,115,116,1104,
                                 202,203,204,205,206,1201,1202,
                                 302,303,306,308,1301,
@@ -1656,7 +1929,7 @@ int allIds[] = {110,111,501,1101,1102,
                                 513,514,515,516,517,518,1601,1602};
                 for (int id : allIds) ShowWindow(GetDlgItem(hwnd, id), SW_HIDE);
                 switch (tab) {
-                    case 0: for (int id : {110,111,501,1101,1102}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
+                    case 0: for (int id : {110,111,501,601,602,603,1101,1102,1103}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
                     case 1: for (int id : {112,113,114,115,116,1104}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
                     case 2: for (int id : {202,203,204,205,206,1201,1202}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
                     case 3: for (int id : {302,303,306,308,1301}) ShowWindow(GetDlgItem(hwnd,id), SW_SHOW); break;
@@ -1698,6 +1971,12 @@ int allIds[] = {110,111,501,1101,1102,
                 case 514: // Record spam key
                     if (!g_recording) { g_recording = true; g_recordingTarget = 4;
                         SetDlgItemTextA(hwnd, 514, "..."); EnableWindow(GetDlgItem(hwnd, 514), FALSE);
+                        SetTimer(hwnd, 1, 50, (TIMERPROC)RecordTimerProc);
+                    }
+                    break;
+                case 602: // Record stop-all key
+                    if (!g_recording) { g_recording = true; g_recordingTarget = 5;
+                        SetDlgItemTextA(hwnd, 602, "..."); EnableWindow(GetDlgItem(hwnd, 602), FALSE);
                         SetTimer(hwnd, 1, 50, (TIMERPROC)RecordTimerProc);
                     }
                     break;
@@ -1770,10 +2049,11 @@ int allIds[] = {110,111,501,1101,1102,
                         { g_config.superJumpKey,  newSuperJumpEnabled, "Pool Super Jump" },
                         { g_config.lagKey,        newLagEnabled,       "Lag Switch" },
                         { g_config.spamKey,       newSpamEnabled,      "Spam Sign" },
+                        { g_config.stopAllKey,    g_config.stopAllKey != 0, "Stop All" },
                     };
-                    for (int i = 0; i < 5; ++i) {
+                    for (int i = 0; i < 6; ++i) {
                         if (!owners[i].enabled) continue;
-                        for (int j = i + 1; j < 5; ++j) {
+                        for (int j = i + 1; j < 6; ++j) {
                             if (owners[j].enabled && owners[i].key == owners[j].key) {
                                 char msg[256];
                                 sprintf_s(msg, "'%s' and '%s' are both bound to the same key (%s).\n"
@@ -1784,7 +2064,7 @@ int allIds[] = {110,111,501,1101,1102,
                             }
                         }
                     }
-                    for (int i = 1; i < 5; ++i) {
+                    for (int i = 1; i < 6; ++i) {
                         if (!owners[i].enabled || owners[i].key == 0) continue;
                         for (auto& pair : g_macros) {
                             if (!newEquipEnabled) break;
@@ -2068,6 +2348,12 @@ LRESULT CALLBACK MacroEditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_TRAYICON: {
+            if (lParam == NIN_BALLOONUSERCLICK) {
+                // Update toast clicked -> open the release page.
+                ShellExecuteA(NULL, "open",
+                              "https://github.com/orbitthegreatest/Orbit-MM2-Macro/releases/latest",
+                              NULL, NULL, SW_SHOWNORMAL);
+            }
             if (lParam == WM_LBUTTONDBLCLK) {
                 // Double-click tray icon → restore settings window
                 if (!g_hwndSettings) {
@@ -2151,6 +2437,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     LoadMacros();
     InitThemeResources();
 
+    // Register the common controls classes (tooltips) before creating windows.
+    INITCOMMONCONTROLSEX icc = { sizeof(INITCOMMONCONTROLSEX), ICC_BAR_CLASSES };
+    InitCommonControlsEx(&icc);
+
     // Load icon from resource (used for the tray icon, all window title bars, and the header banner)
     HICON hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(1));
     if (!hIcon) {
@@ -2208,6 +2498,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_nid.hIcon = hIcon;
     wcscpy_s(g_nid.szTip, L"Orbit MM2 Macro");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
+
+    // Background update detector: polls the GitHub releases API and notifies
+    // when a release newer than the current build is published.
+    std::thread(UpdateCheckWorker).detach();
 
     if (!g_config.startMinimized)
         PostMessage(g_hwndMain, WM_COMMAND, ID_TRAY_SETTINGS, 0);

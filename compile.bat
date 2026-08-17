@@ -35,9 +35,9 @@ if exist mm2_macro_logo.ico (
 
 echo Compiling OrbitMM2Macro.cpp ...
 if exist resource.o (
-    g++ -O2 -std=c++11 -mwindows OrbitMM2Macro.cpp resource.o -o OrbitMM2Macro.exe -lwinmm -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lole32 -luxtheme -ldwmapi -liphlpapi -static
+    g++ -O2 -std=c++11 -mwindows OrbitMM2Macro.cpp resource.o -o OrbitMM2Macro.exe -lwinmm -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lole32 -luxtheme -ldwmapi -liphlpapi -lwinhttp -static
 ) else (
-    g++ -O2 -std=c++11 -mwindows OrbitMM2Macro.cpp -o OrbitMM2Macro.exe -lwinmm -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lole32 -luxtheme -ldwmapi -liphlpapi -static
+    g++ -O2 -std=c++11 -mwindows OrbitMM2Macro.cpp -o OrbitMM2Macro.exe -lwinmm -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lole32 -luxtheme -ldwmapi -liphlpapi -lwinhttp -static
 )
 
 if errorlevel 1 (
