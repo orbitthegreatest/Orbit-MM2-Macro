@@ -1167,7 +1167,6 @@ void OnHotkey(UINT vk, bool down) {
             g_glitchActive = true;
             HoldW(true);
             std::thread(SpeedGlitchWorker).detach();
-            ShowHint("Speed Glitch started");
             if (g_statusLabelGlitch) SetWindowTextA(g_statusLabelGlitch, "Glitch: Running");
         } else if (!down && g_glitchActive) {
             g_glitchActive = false;
@@ -1185,7 +1184,6 @@ void OnHotkey(UINT vk, bool down) {
             g_glitchActive = true;
             HoldW(true);
             std::thread(SpeedGlitchWorker).detach();
-            ShowHint("Speed Glitch started");
             if (g_statusLabelGlitch) SetWindowTextA(g_statusLabelGlitch, "Glitch: Running");
         }
     }
@@ -1272,7 +1270,6 @@ void OnMacroHotkey(UINT vk) {
         if (pair.second.hotkey == vk && vk != 0) {
             Macro m = pair.second; // copy — the map may change on the GUI thread
             std::thread([m]() { RunMacro(m); }).detach();
-            ShowHint((pair.second.name + " started").c_str());
             break;
         }
     }
