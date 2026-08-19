@@ -1,0 +1,38 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+
+      - name: Compile resources
+        shell: msys2 {0}
+        run: windres resource.rc -O coff -o resource.o
+
+      - name: Compile OrbitMM2Macro.exe
+        shell: msys2 {0}
+        run: >
+          g++ -O2 -std=c++11 -mwindows OrbitMM2Macro.cpp resource.o
+          -o OrbitMM2Macro.exe
+          -lwinmm -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lole32
+          -luxtheme -ldwmapi -liphlpapi -lwinhttp -static
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrbitMM2Macro
+          path: OrbitMM2Macro.exe

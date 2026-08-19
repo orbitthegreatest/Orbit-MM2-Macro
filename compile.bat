@@ -23,6 +23,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
+set OUTDIR=..\OUTPUTS\mm2 macro output
+if not exist "%OUTDIR%" mkdir "%OUTDIR%"
+
 echo Compiling resources...
 if exist mm2_macro_logo.ico (
     windres resource.rc -O coff -o resource.o
@@ -35,9 +38,9 @@ if exist mm2_macro_logo.ico (
 
 echo Compiling OrbitMM2Macro.cpp ...
 if exist resource.o (
-    g++ -O2 -std=c++11 -mwindows OrbitMM2Macro.cpp resource.o -o OrbitMM2Macro.exe -lwinmm -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lole32 -luxtheme -ldwmapi -liphlpapi -lwinhttp -static
+    g++ -O2 -std=c++11 -mwindows OrbitMM2Macro.cpp resource.o -o "%OUTDIR%\OrbitMM2Macro.exe" -lwinmm -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lole32 -luxtheme -ldwmapi -liphlpapi -lwinhttp -static
 ) else (
-    g++ -O2 -std=c++11 -mwindows OrbitMM2Macro.cpp -o OrbitMM2Macro.exe -lwinmm -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lole32 -luxtheme -ldwmapi -liphlpapi -lwinhttp -static
+    g++ -O2 -std=c++11 -mwindows OrbitMM2Macro.cpp -o "%OUTDIR%\OrbitMM2Macro.exe" -lwinmm -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lole32 -luxtheme -ldwmapi -liphlpapi -lwinhttp -static
 )
 
 if errorlevel 1 (
@@ -50,6 +53,7 @@ echo.
 echo ================================
 echo [SUCCESS] OrbitMM2Macro.exe created!
 echo ================================
+echo Output: %OUTDIR%\OrbitMM2Macro.exe
 echo.
 echo The icon is embedded, so it will show in the folder.
 pause

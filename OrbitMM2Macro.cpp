@@ -172,7 +172,7 @@ struct Config {
 // ==============================
 //  Update detector (GitHub releases)
 // ==============================
-static const char* g_currentVersion = "1.6.0";
+static const char* g_currentVersion = "2.0.0";
 static std::string g_lastNotifiedVersion;
 
 // Forward declarations
@@ -227,9 +227,19 @@ LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static HBRUSH g_hbrBg     = NULL;
 static HBRUSH g_hbrEdit   = NULL;
 static HBRUSH g_hbrHeader = NULL;
+static HBRUSH g_hbrBgGrad = NULL;
 static HFONT  g_hFont     = NULL;
 static HFONT  g_hFontBold = NULL;
+static HFONT  g_hFontBtn  = NULL;
 static HICON  g_hAppIcon  = NULL;
+
+static COLORREF LerpColor(COLORREF a, COLORREF b, float t) {
+    if (t <= 0.f) return a;
+    if (t >= 1.f) return b;
+    return RGB((BYTE)(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t),
+               (BYTE)(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t),
+               (BYTE)(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t));
+}
 
 void InitThemeResources() {
     g_hbrBg     = CreateSolidBrush(COL_BG);
@@ -241,6 +251,27 @@ void InitThemeResources() {
     g_hFontBold = CreateFontA(-19, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_hFontBtn  = CreateFontA(-14, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                               DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    // Vertical gradient background: deep red-black at the top fading to pure
+    // black at the bottom. Stored as a 1x256 pattern brush (tiles seamlessly).
+    const int GH = 256;
+    BYTE* bits = new BYTE[GH * 4];
+    for (int y = 0; y < GH; ++y) {
+        float t = (float)y / (GH - 1);
+        bits[y * 4 + 0] = (BYTE)(8 + (1 - t) * 8);
+        bits[y * 4 + 1] = (BYTE)(7 + (1 - t) * 5);
+        bits[y * 4 + 2] = (BYTE)(13 + (1 - t) * 21);
+        bits[y * 4 + 3] = 0;
+    }
+    HBITMAP bmp = CreateBitmap(1, GH, 1, 32, bits);
+    delete[] bits;
+    if (bmp) {
+        g_hbrBgGrad = CreatePatternBrush(bmp);
+        DeleteObject(bmp);
+    }
+    if (!g_hbrBgGrad) g_hbrBgGrad = CreateSolidBrush(COL_BG);
 }
 
 // Gives a window (and its title bar, on Win10 1809+/Win11) the dark chrome to match the theme.
@@ -373,6 +404,7 @@ static void ShowHint(const char* text) {
     if (y < 8) y = 8;
     SetWindowPos(g_hintPopup, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     ShowWindow(g_hintPopup, SW_SHOWNOACTIVATE);
+    AnimateWindow(g_hintPopup, 120, AW_ACTIVATE | AW_BLEND);
     g_hintShown = true;
     InvalidateRect(g_hintPopup, NULL, TRUE);
     if (g_hwndMain) {
@@ -383,7 +415,7 @@ static void ShowHint(const char* text) {
 
 static void HideHint() {
     if (g_hintPopup && g_hintShown) {
-        ShowWindow(g_hintPopup, SW_HIDE);
+        AnimateWindow(g_hintPopup, 120, AW_HIDE | AW_BLEND);
         g_hintShown = false;
     }
 }
@@ -413,46 +445,179 @@ LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-// Owner-draw renderer shared by every flat accent push-button in the app
-// (Save/Cancel/Record/New/Edit/Delete/Add/Del etc.)
-void DrawThemedPushButton(LPDRAWITEMSTRUCT dis) {
+// ==============================
+//  Animated yellow/red buttons + global UI animation engine
+// ==============================
+static const UINT ANIM_TIMER_ID = 2;
+static const DWORD ANIM_TICK_MS = 16;
+
+struct BtnAnim { float hover = 0.f; float press = 0.f; };
+static std::map<HWND, BtnAnim> g_btnAnims;
+static std::map<HWND, float> g_winPhase; // header light-sweep phase per window
+static float g_statusPhase = 0.f;
+static ULONGLONG g_lastAnimTick = 0;
+
+// Primary actions are yellow (Save/Record/New/Edit/Add), destructive ones red
+// (Cancel/Delete/Del), so every window clearly separates the two.
+static bool BtnIsYellow(HWND hwnd) {
+    int id = GetDlgCtrlID(hwnd);
+    switch (id) {
+        case IDOK: case 114: case 203: case 303: case 414: case 514:
+        case 602: case 402: case 403: case 208: return true;
+        default: return false;
+    }
+}
+static bool BtnIsRed(HWND hwnd) {
+    int id = GetDlgCtrlID(hwnd);
+    switch (id) {
+        case IDCANCEL: case 404: case 209: return true;
+        default: return false;
+    }
+}
+
+// Owner-draw renderer for every push button. The hover/press progress floats
+// (0..1) are advanced by UIAnimTick and stored per-HWND, giving smooth color
+// fades, a glow ring on hover and a subtle press-in effect.
+void DrawAnimatedButton(LPDRAWITEMSTRUCT dis) {
     char text[128] = {0};
     GetWindowTextA(dis->hwndItem, text, sizeof(text));
     bool pressed  = (dis->itemState & ODS_SELECTED) != 0;
     bool disabled = (dis->itemState & ODS_DISABLED) != 0;
     bool focused  = (dis->itemState & ODS_FOCUS) != 0;
 
+    BtnAnim& st = g_btnAnims[dis->hwndItem];
+    bool yellow = BtnIsYellow(dis->hwndItem);
+
     HDC dc = dis->hDC;
     RECT rc = dis->rcItem;
+    LONG W = rc.right - rc.left, H = rc.bottom - rc.top;
+    LONG radius = 10;
 
-    COLORREF face = disabled ? RGB(52,52,57) : (pressed ? COL_ACCENT_DK : COL_ACCENT);
-    HBRUSH br = CreateSolidBrush(face);
-    HPEN pen = CreatePen(PS_SOLID, 1, focused && !disabled ? COL_ACCENT_LT : face);
-    HGDIOBJ oldBr = SelectObject(dc, br);
-    HGDIOBJ oldPen = SelectObject(dc, pen);
-    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
-    SelectObject(dc, oldBr);
-    SelectObject(dc, oldPen);
-    DeleteObject(br);
-    DeleteObject(pen);
+    COLORREF base  = yellow ? RGB(236, 182, 30) : RGB(214, 44, 54);
+    COLORREF hover = yellow ? RGB(255, 208, 66) : RGB(246, 78, 88);
+    COLORREF press = yellow ? RGB(204, 150, 22) : RGB(176, 28, 40);
+    if (disabled) base = hover = press = RGB(48, 48, 53);
+
+    float h = st.hover;
+    float p = st.press;
+    COLORREF face = LerpColor(base, hover, h);
+    if (pressed) face = press;
+    else if (p > 0.f) face = LerpColor(face, press, p * 0.6f);
+
+    if (h > 0.02f && !disabled) {
+        // Hover glow: brighter outer ring around the rounded face.
+        HPEN glowPen = CreatePen(PS_SOLID, 2, LerpColor(face, RGB(255, 255, 255), h * 0.35f));
+        HBRUSH br = CreateSolidBrush(face);
+        HGDIOBJ oldPen = SelectObject(dc, glowPen);
+        HGDIOBJ oldBr = SelectObject(dc, br);
+        RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBr);
+        DeleteObject(glowPen);
+        DeleteObject(br);
+    } else {
+        HBRUSH br = CreateSolidBrush(face);
+        HPEN pen = CreatePen(PS_SOLID, 1, focused ? RGB(255, 255, 255) : face);
+        HGDIOBJ oldBr = SelectObject(dc, br);
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBr);
+        DeleteObject(pen);
+        DeleteObject(br);
+    }
+
+    // Soft top highlight that grows with the hover amount.
+    if (!disabled && h > 0.01f) {
+        RECT top = rc;
+        top.bottom = top.top + 2 + (LONG)(4 * h);
+        HBRUSH hbrTop = CreateSolidBrush(LerpColor(face, RGB(255, 255, 255), 0.22f * h));
+        FillRect(dc, &top, hbrTop);
+        DeleteObject(hbrTop);
+    }
+
+    RECT tr = rc;
+    int inset = pressed ? 2 : 1;
+    tr.left += inset; tr.right -= inset; tr.top += inset; tr.bottom -= inset;
 
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, disabled ? COL_TEXT_DIS : RGB(255,255,255));
-    HFONT oldFont = (HFONT)SelectObject(dc, g_hFont);
-    DrawTextA(dc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(dc, disabled ? COL_TEXT_DIS : (yellow ? RGB(24, 16, 4) : RGB(255, 255, 255)));
+    HFONT oldFont = (HFONT)SelectObject(dc, g_hFontBtn);
+    DrawTextA(dc, text, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, oldFont);
 }
 
+// One tick of the global animation loop (runs on a 16ms timer on the main
+// window): eases every button's hover/press state toward its target, pulses
+// the status labels while macros are running and keeps the header sweep
+// animating by invalidating the visible windows.
+static void UIAnimTick() {
+    POINT pt;
+    GetCursorPos(&pt);
+    HWND under = WindowFromPoint(pt);
+
+    ULONGLONG now = GetTickCount64();
+    if (g_lastAnimTick == 0) g_lastAnimTick = now;
+    float dt = (float)(now - g_lastAnimTick) / 1000.f;
+    g_lastAnimTick = now;
+    if (dt > 0.05f) dt = 0.05f;
+    g_statusPhase += dt * 4.f;
+
+    for (auto& kv : g_btnAnims) {
+        HWND h = kv.first;
+        if (!IsWindow(h)) continue;
+        BtnAnim& st = kv.second;
+        bool hover = (h == under) && IsWindowVisible(h) && IsWindowEnabled(h);
+        bool pushed = (SendMessage(h, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0 && IsWindowEnabled(h);
+        float k = dt * 14.f; if (k > 1.f) k = 1.f;
+        float nh = st.hover + (hover ? 1.f - st.hover : 0.f - st.hover) * k;
+        float kp = dt * 16.f; if (kp > 1.f) kp = 1.f;
+        float np = st.press + (pushed ? 1.f - st.press : 0.f - st.press) * kp;
+        if (fabsf(nh - st.hover) > 0.001f || fabsf(np - st.press) > 0.001f) {
+            st.hover = nh;
+            st.press = np;
+            InvalidateRect(h, NULL, FALSE);
+        }
+    }
+
+    if (g_hwndSettings && IsWindowVisible(g_hwndSettings)) {
+        // Pulsing status labels while their macro is active.
+        if (g_statusLabelGlitch && g_glitchActive.load(std::memory_order_relaxed))
+            InvalidateRect(g_statusLabelGlitch, NULL, FALSE);
+        if (g_statusLabelSpam && g_spamActive.load(std::memory_order_relaxed))
+            InvalidateRect(g_statusLabelSpam, NULL, FALSE);
+        if (g_statusLabelLag && g_lagSwitchOn.load(std::memory_order_relaxed))
+            InvalidateRect(g_statusLabelLag, NULL, FALSE);
+        g_winPhase[g_hwndSettings] += dt * 1.6f;
+        InvalidateRect(g_hwndSettings, NULL, FALSE);
+    }
+    if (g_hwndMacroEditor && IsWindowVisible(g_hwndMacroEditor)) {
+        g_winPhase[g_hwndMacroEditor] += dt * 1.6f;
+        InvalidateRect(g_hwndMacroEditor, NULL, FALSE);
+    }
+}
+
 // Shared header band drawn at the top of the Settings and Macro Editor windows.
+// The background is a red-black gradient and the red accent line has a moving
+// light sweep animated by the global UI timer.
 void DrawThemedHeader(HWND hwnd, HDC dc, const char* title) {
     RECT rc; GetClientRect(hwnd, &rc);
-    FillRect(dc, &rc, g_hbrBg);
+    FillRect(dc, &rc, g_hbrBgGrad);
     RECT header = rc; header.bottom = 54;
     FillRect(dc, &header, g_hbrHeader);
     RECT line = {0, 52, rc.right, 54};
     HBRUSH hbrLine = CreateSolidBrush(COL_ACCENT);
     FillRect(dc, &line, hbrLine);
     DeleteObject(hbrLine);
+    // Animated light sweep travelling along the accent line.
+    float phase = g_winPhase[hwnd];
+    int w = rc.right > 0 ? rc.right : 1;
+    const int sweepW = 90;
+    int sx = (int)(fmodf(phase * w, (float)(w + sweepW))) - sweepW;
+    RECT sweep = {sx, 52, sx + sweepW, 54};
+    HBRUSH hbrSweep = CreateSolidBrush(LerpColor(COL_ACCENT, RGB(255, 125, 135), 0.5f + 0.5f * sinf(phase * 8.f)));
+    FillRect(dc, &sweep, hbrSweep);
+    DeleteObject(hbrSweep);
     if (g_hAppIcon) DrawIconEx(dc, 14, 10, g_hAppIcon, 32, 32, 0, NULL, DI_NORMAL);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, COL_TEXT);
@@ -1251,6 +1416,21 @@ void OnLagHotkey(UINT vk, bool down) {
 // ==============================
 //  Low-level hooks
 // ==============================
+// Matches a raw key code against a configured key. Generic codes
+// (VK_SHIFT/VK_CONTROL/VK_MENU/VK_LWIN) match either side; specific codes
+// (VK_RMENU etc.) match ONLY that exact key, so a bound Right Alt never
+// reacts to Left Alt.
+static bool KeyMatches(UINT rawVk, UINT cfgKey) {
+    if (rawVk == cfgKey) return true;
+    switch (cfgKey) {
+        case VK_SHIFT:   return rawVk == VK_LSHIFT || rawVk == VK_RSHIFT;
+        case VK_CONTROL: return rawVk == VK_LCONTROL || rawVk == VK_RCONTROL;
+        case VK_MENU:    return rawVk == VK_LMENU || rawVk == VK_RMENU;
+        case VK_LWIN:    return rawVk == VK_LWIN || rawVk == VK_RWIN;
+        default:         return false;
+    }
+}
+
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && (wParam == WM_KEYDOWN || wParam == WM_KEYUP ||
                        wParam == WM_SYSKEYDOWN || wParam == WM_SYSKEYUP)) {
@@ -1260,44 +1440,50 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         bool up   = (wParam == WM_KEYUP   || wParam == WM_SYSKEYUP)   &&
                     !(p->flags & LLKHF_INJECTED);
         if (down || up) {
-            UINT vk = p->vkCode;
-            // Normalize left/right modifier codes so recorded generic codes
-            // (VK_SHIFT / VK_CONTROL / VK_MENU / VK_LWIN) match physical presses.
-            if (vk == VK_LSHIFT || vk == VK_RSHIFT) vk = VK_SHIFT;
-            else if (vk == VK_LCONTROL || vk == VK_RCONTROL) vk = VK_CONTROL;
-            else if (vk == VK_LMENU || vk == VK_RMENU) vk = VK_MENU;
-            else if (vk == VK_LWIN || vk == VK_RWIN) vk = VK_LWIN;
+            UINT raw = p->vkCode;
+            // Normalized code is only the repeat-tracking slot so left/right
+            // modifiers share one entry (no double-fire). Matching uses the
+            // raw specific code so a bound Right Alt never matches Left Alt.
+            UINT slot = raw;
+            if (raw == VK_LSHIFT || raw == VK_RSHIFT) slot = VK_SHIFT;
+            else if (raw == VK_LCONTROL || raw == VK_RCONTROL) slot = VK_CONTROL;
+            else if (raw == VK_LMENU || raw == VK_RMENU) slot = VK_MENU;
+            else if (raw == VK_LWIN || raw == VK_RWIN) slot = VK_LWIN;
             // While recording, capture the ACTUAL key press from the hook. If
-            // Alt is physically down (e.g. AltGr keyboards report Ctrl+Alt),
-            // record Alt so a plain Ctrl press can never hijack the binding.
+            // Alt is physically down (AltGr keyboards can report Ctrl+Alt for
+            // a Right Alt press), record the specific Alt that is down so a
+            // plain Ctrl or the other Alt can never hijack the binding.
             if (g_recording && down) {
-                g_captureKey = (GetAsyncKeyState(VK_MENU) & 0x8000) ? VK_MENU : vk;
+                if (GetAsyncKeyState(VK_MENU) & 0x8000)
+                    g_captureKey = (GetAsyncKeyState(VK_RMENU) & 0x8000) ? VK_RMENU : VK_LMENU;
+                else
+                    g_captureKey = raw;
             }
             if (g_recording) return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
             // Fire only on press/release transitions (auto-repeat of a held key
             // must not re-trigger a toggle).
             static bool keyDown[256] = {false};
             if (down) {
-                if (!keyDown[vk]) {
-                    keyDown[vk] = true;
-                    if (vk == g_config.stopAllKey && g_config.stopAllKey) OnStopAllHotkey();
+                if (!keyDown[slot]) {
+                    keyDown[slot] = true;
+                    if (g_config.stopAllKey && KeyMatches(raw, g_config.stopAllKey)) OnStopAllHotkey();
                     else if (g_keybindsLocked.load(std::memory_order_relaxed)) { /* keybinds locked */ }
-                    else if (vk == g_config.glitchKey && g_config.glitchKey) OnHotkey(vk, true);
-                    else if (vk == g_config.lagKey && g_config.lagKey) OnLagHotkey(vk, true);
-                    else if (vk == g_config.spamKey && g_config.spamKey) OnSpamHotkey(vk, true);
-                    else if (vk == g_config.sitKey && g_config.sitKey) OnSitHotkey(vk);
-                    else if (vk == g_config.superJumpKey && g_config.superJumpKey) OnSuperJumpHotkey(vk);
+                    else if (g_config.glitchKey && KeyMatches(raw, g_config.glitchKey)) OnHotkey(raw, true);
+                    else if (g_config.lagKey && KeyMatches(raw, g_config.lagKey)) OnLagHotkey(raw, true);
+                    else if (g_config.spamKey && KeyMatches(raw, g_config.spamKey)) OnSpamHotkey(raw, true);
+                    else if (g_config.sitKey && KeyMatches(raw, g_config.sitKey)) OnSitHotkey(raw);
+                    else if (g_config.superJumpKey && KeyMatches(raw, g_config.superJumpKey)) OnSuperJumpHotkey(raw);
                     else {
                         for (auto& pair : g_macros)
-                            if (pair.second.hotkey == vk) { OnMacroHotkey(vk); break; }
+                            if (pair.second.hotkey && KeyMatches(raw, pair.second.hotkey)) { OnMacroHotkey(raw); break; }
                     }
                 }
             } else {
-                keyDown[vk] = false;
+                keyDown[slot] = false;
                 if (g_keybindsLocked.load(std::memory_order_relaxed)) { /* keybinds locked */ }
-                else if (vk == g_config.glitchKey && g_config.glitchKey) OnHotkey(vk, false);
-                else if (vk == g_config.lagKey && g_config.lagKey) OnLagHotkey(vk, false);
-                else if (vk == g_config.spamKey && g_config.spamKey) OnSpamHotkey(vk, false);
+                else if (g_config.glitchKey && KeyMatches(raw, g_config.glitchKey)) OnHotkey(raw, false);
+                else if (g_config.lagKey && KeyMatches(raw, g_config.lagKey)) OnLagHotkey(raw, false);
+                else if (g_config.spamKey && KeyMatches(raw, g_config.spamKey)) OnSpamHotkey(raw, false);
             }
         }
     }
@@ -1322,21 +1508,21 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             // While recording, capture the actual mouse button from the hook.
             if (g_recording && down) g_captureKey = vk;
             if (g_recording) return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
-            if (down && vk == g_config.stopAllKey && g_config.stopAllKey) {
+            if (down && g_config.stopAllKey && KeyMatches(vk, g_config.stopAllKey)) {
                 OnStopAllHotkey();
             } else if (g_keybindsLocked.load(std::memory_order_relaxed)) { /* keybinds locked */ }
-            else if (vk == g_config.glitchKey && g_config.glitchKey) {
+            else if (g_config.glitchKey && KeyMatches(vk, g_config.glitchKey)) {
                 if (down || up) OnHotkey(vk, down);
-            } else if (vk == g_config.lagKey && g_config.lagKey) {
+            } else if (g_config.lagKey && KeyMatches(vk, g_config.lagKey)) {
                 if (down || up) OnLagHotkey(vk, down);
-            } else if (vk == g_config.spamKey && g_config.spamKey) {
+            } else if (g_config.spamKey && KeyMatches(vk, g_config.spamKey)) {
                 if (down || up) OnSpamHotkey(vk, down);
             } else if (down) {
-                if (vk == g_config.sitKey && g_config.sitKey)          OnSitHotkey(vk);
-                else if (vk == g_config.superJumpKey && g_config.superJumpKey) OnSuperJumpHotkey(vk);
+                if (g_config.sitKey && KeyMatches(vk, g_config.sitKey))          OnSitHotkey(vk);
+                else if (g_config.superJumpKey && KeyMatches(vk, g_config.superJumpKey)) OnSuperJumpHotkey(vk);
                 else {
                     for (auto& pair : g_macros)
-                        if (pair.second.hotkey == vk) { OnMacroHotkey(vk); break; }
+                        if (pair.second.hotkey && KeyMatches(vk, pair.second.hotkey)) { OnMacroHotkey(vk); break; }
                 }
             }
         }
@@ -1968,7 +2154,18 @@ int allIds[] = {110,111,501,601,602,603,1101,1102,1103,
             int id = GetDlgCtrlID(ctl);
             HDC dc = (HDC)wParam;
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, (id == 116 || id == 206 || id == 308 || id == 416 || id == 518) ? COL_ACCENT_LT : COL_TEXT);
+            COLORREF c = COL_TEXT;
+            if (id == 116 || id == 206 || id == 308 || id == 416 || id == 518) {
+                // Status labels: idle = calm red, running = pulsing glow.
+                bool active = (id == 116 && g_glitchActive.load(std::memory_order_relaxed)) ||
+                              (id == 416 && g_lagSwitchOn.load(std::memory_order_relaxed)) ||
+                              (id == 518 && g_spamActive.load(std::memory_order_relaxed));
+                if (active)
+                    c = LerpColor(COL_ACCENT, COL_ACCENT_LT, 0.5f + 0.5f * sinf(g_statusPhase * 3.f));
+                else
+                    c = COL_ACCENT_LT;
+            }
+            SetTextColor(dc, c);
             return (LRESULT)g_hbrBg;
         }
         case WM_CTLCOLOREDIT:
@@ -1987,7 +2184,7 @@ int allIds[] = {110,111,501,601,602,603,1101,1102,1103,
         }
         case WM_DRAWITEM: {
             LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lParam;
-            if (dis->CtlType == ODT_BUTTON) { DrawThemedPushButton(dis); return TRUE; }
+            if (dis->CtlType == ODT_BUTTON) { DrawAnimatedButton(dis); return TRUE; }
             break;
         }
 
@@ -2394,7 +2591,7 @@ LRESULT CALLBACK MacroEditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         case WM_DRAWITEM: {
             LPDRAWITEMSTRUCT dis = (LPDRAWITEMSTRUCT)lParam;
-            if (dis->CtlType == ODT_BUTTON) { DrawThemedPushButton(dis); return TRUE; }
+            if (dis->CtlType == ODT_BUTTON) { DrawAnimatedButton(dis); return TRUE; }
             break;
         }
 
@@ -2428,7 +2625,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                                      CW_USEDEFAULT, CW_USEDEFAULT, 740, 470,
                                                      hwnd, NULL, GetModuleHandle(NULL), NULL);
                 }
-                ShowWindow(g_hwndSettings, SW_SHOW);
+                if (!IsWindowVisible(g_hwndSettings)) {
+                    ShowWindow(g_hwndSettings, SW_SHOW);
+                    AnimateWindow(g_hwndSettings, 150, AW_ACTIVATE | AW_BLEND);
+                }
                 SetForegroundWindow(g_hwndSettings);
             }
             if (lParam == WM_RBUTTONUP) {
@@ -2446,14 +2646,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_COMMAND: {
             switch (LOWORD(wParam)) {
-                case ID_TRAY_SETTINGS: {
+case ID_TRAY_SETTINGS: {
                     if (!g_hwndSettings) {
 g_hwndSettings = CreateWindowExA(0, "SettingsClass", "Orbit MM2 Settings",
                                                      WS_POPUP | WS_BORDER | WS_SYSMENU | WS_MINIMIZEBOX,
                                                      CW_USEDEFAULT, CW_USEDEFAULT, 740, 470,
                                                      hwnd, NULL, GetModuleHandle(NULL), NULL);
                     }
-                    ShowWindow(g_hwndSettings, SW_SHOW);
+                    if (!IsWindowVisible(g_hwndSettings)) {
+                        ShowWindow(g_hwndSettings, SW_SHOW);
+                        AnimateWindow(g_hwndSettings, 150, AW_ACTIVATE | AW_BLEND);
+                    }
                     SetForegroundWindow(g_hwndSettings);
                     break;
                 }
@@ -2469,6 +2672,7 @@ g_hwndSettings = CreateWindowExA(0, "SettingsClass", "Orbit MM2 Settings",
             break;
         case WM_TIMER:
             if (wParam == HINT_TIMER_ID) HideHint();
+            else if (wParam == ANIM_TIMER_ID) UIAnimTick();
             break;
         default:
             return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -2562,6 +2766,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                                  400, 200, NULL, NULL, hInstance, NULL);
     if (!g_hwndMain) return 1;
     ShowWindow(g_hwndMain, SW_HIDE);
+    // Global UI animation timer: drives button hover/press animations, the
+    // pulsing status lights and the header light sweep.
+    SetTimer(g_hwndMain, ANIM_TIMER_ID, ANIM_TICK_MS, NULL);
 
     // Press feedback toast popup (shown next to the cursor when the global
     // stop/start key is pressed).
