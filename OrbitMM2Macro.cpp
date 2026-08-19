@@ -612,12 +612,20 @@ static void UIAnimTick() {
             InvalidateRect(g_statusLabelSpam, NULL, FALSE);
         if (g_statusLabelLag && g_lagSwitchOn.load(std::memory_order_relaxed))
             InvalidateRect(g_statusLabelLag, NULL, FALSE);
+        // Animate the header sweep: only the 55px header band is invalidated
+        // so the rest of the window (tabs, listviews, edits) never repaints.
         g_winPhase[g_hwndSettings] += dt * 1.6f;
-        InvalidateRect(g_hwndSettings, NULL, FALSE);
+        RECT hr;
+        GetClientRect(g_hwndSettings, &hr);
+        hr.bottom = 55;
+        InvalidateRect(g_hwndSettings, &hr, FALSE);
     }
     if (g_hwndMacroEditor && IsWindowVisible(g_hwndMacroEditor)) {
         g_winPhase[g_hwndMacroEditor] += dt * 1.6f;
-        InvalidateRect(g_hwndMacroEditor, NULL, FALSE);
+        RECT hr;
+        GetClientRect(g_hwndMacroEditor, &hr);
+        hr.bottom = 55;
+        InvalidateRect(g_hwndMacroEditor, &hr, FALSE);
     }
 }
 
@@ -668,12 +676,13 @@ static void DrawHeaderDot(HDC dc, int cx, int cy, bool red, const BtnAnim& st, f
 }
 
 // Shared header band drawn at the top of the Settings and Macro Editor windows.
-// The background is a red-black gradient and the red accent line has a moving
-// light sweep animated by the global UI timer.
+// Only the 54px header band is painted here (the body background is handled by
+// the caller via ps.rcPaint), so the animated sweep never forces the whole
+// window to repaint. The red accent line has a moving light sweep animated by
+// the global UI timer.
 void DrawThemedHeader(HWND hwnd, HDC dc, const char* title) {
     RECT rc; GetClientRect(hwnd, &rc);
-    FillRect(dc, &rc, g_hbrBgGrad);
-    RECT header = rc; header.bottom = 54;
+    RECT header = {0, 0, rc.right, 54};
     FillRect(dc, &header, g_hbrHeader);
     RECT line = {0, 52, rc.right, 54};
     HBRUSH hbrLine = CreateSolidBrush(COL_ACCENT);
@@ -2222,7 +2231,10 @@ int allIds[] = {110,111,501,601,602,603,1101,1102,1103,
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
-            DrawThemedHeader(hwnd, dc, "Orbit MM2 Macro - Settings");
+            // Only repaint the damaged region with the gradient; the header
+            // band (with its animated sweep) is repainted when damaged too.
+            FillRect(dc, &ps.rcPaint, g_hbrBgGrad);
+            if (ps.rcPaint.top < 55) DrawThemedHeader(hwnd, dc, "Orbit MM2 Macro - Settings");
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -2652,7 +2664,8 @@ LRESULT CALLBACK MacroEditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
-            DrawThemedHeader(hwnd, dc, "Edit Macro");
+            FillRect(dc, &ps.rcPaint, g_hbrBgGrad);
+            if (ps.rcPaint.top < 55) DrawThemedHeader(hwnd, dc, "Edit Macro");
             EndPaint(hwnd, &ps);
             return 0;
         }
