@@ -454,6 +454,8 @@ static const DWORD ANIM_TICK_MS = 16;
 struct BtnAnim { float hover = 0.f; float press = 0.f; };
 static std::map<HWND, BtnAnim> g_btnAnims;
 static std::map<HWND, float> g_winPhase; // header light-sweep phase per window
+struct DotAnims { BtnAnim close; BtnAnim mini; }; // red close dot, yellow minimize dot
+static std::map<HWND, DotAnims> g_dotAnims;
 static float g_statusPhase = 0.f;
 static ULONGLONG g_lastAnimTick = 0;
 
@@ -580,6 +582,28 @@ static void UIAnimTick() {
         }
     }
 
+    // Header dots: ease hover (scale + glow) and press states. Hover target is
+    // set by WM_MOUSEMOVE/WM_MOUSELEAVE into the "DotHover" window property.
+    HWND dotWins[] = { g_hwndSettings, g_hwndMacroEditor };
+    for (HWND w : dotWins) {
+        if (!w || !IsWindow(w) || !IsWindowVisible(w)) continue;
+        DotAnims& da = g_dotAnims[w];
+        int hoverDot = (int)(INT_PTR)GetPropA(w, "DotHover");
+        bool lbtn = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        BtnAnim* dots[2] = { &da.close, &da.mini };
+        for (int i = 0; i < 2; ++i) {
+            BtnAnim& d = *dots[i];
+            bool target = (hoverDot == i + 1);
+            float kh = dt * 14.f; if (kh > 1.f) kh = 1.f;
+            float nh = d.hover + (target ? 1.f - d.hover : -d.hover) * kh;
+            bool tp = target && lbtn;
+            float kp = dt * 18.f; if (kp > 1.f) kp = 1.f;
+            float np = d.press + (tp ? 1.f - d.press : -d.press) * kp;
+            d.hover = nh;
+            d.press = np;
+        }
+    }
+
     if (g_hwndSettings && IsWindowVisible(g_hwndSettings)) {
         // Pulsing status labels while their macro is active.
         if (g_statusLabelGlitch && g_glitchActive.load(std::memory_order_relaxed))
@@ -595,6 +619,52 @@ static void UIAnimTick() {
         g_winPhase[g_hwndMacroEditor] += dt * 1.6f;
         InvalidateRect(g_hwndMacroEditor, NULL, FALSE);
     }
+}
+
+// macOS-style title bar dots: red = close, yellow = minimize. They animate:
+// a subtle idle breathing glow, hover scales them up with a light ring, and
+// pressing squashes them down slightly.
+static void DrawHeaderDot(HDC dc, int cx, int cy, bool red, const BtnAnim& st, float pulse) {
+    COLORREF base  = red ? RGB(255, 95, 86)  : RGB(255, 189, 46);
+    COLORREF hover = red ? RGB(255, 128, 120): RGB(255, 216, 90);
+    COLORREF press = red ? RGB(208, 60, 54)  : RGB(222, 148, 22);
+
+    float h = st.hover, p = st.press;
+    int r = 9 + (int)(2 * h);
+    COLORREF face = LerpColor(base, hover, h);
+    if (p > 0.f) face = LerpColor(face, press, p * 0.8f);
+    else face = LerpColor(face, hover, h * 0.5f);
+    // Idle breathing: soft brightness pulse that fades out as the dot is hovered.
+    face = LerpColor(face, RGB(255, 255, 255), pulse * 0.10f * (1.f - h));
+
+    if (h > 0.02f) {
+        HPEN pen = CreatePen(PS_SOLID, 3, LerpColor(face, RGB(255, 255, 255), 0.25f * h));
+        HBRUSH br = CreateSolidBrush(face);
+        HGDIOBJ oldPen = SelectObject(dc, pen);
+        HGDIOBJ oldBr = SelectObject(dc, br);
+        Ellipse(dc, cx - r - 1, cy - r - 1, cx + r + 1, cy + r + 1);
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBr);
+        DeleteObject(pen);
+        DeleteObject(br);
+    } else {
+        HBRUSH br = CreateSolidBrush(face);
+        HGDIOBJ oldBr = SelectObject(dc, br);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
+        SelectObject(dc, oldBr);
+        SelectObject(dc, oldPen);
+        DeleteObject(br);
+    }
+    // Small top-left gloss highlight so the dots read as glossy orbs.
+    HBRUSH gloss = CreateSolidBrush(LerpColor(face, RGB(255, 255, 255), 0.35f));
+    HGDIOBJ oldGloss = SelectObject(dc, gloss);
+    HGDIOBJ oldGlossPen = SelectObject(dc, GetStockObject(NULL_PEN));
+    int gw = (int)(r * 0.65f), gh = (int)(r * 0.38f);
+    Ellipse(dc, cx - r + 2, cy - r + 1, cx - r + 2 + gw, cy - r + 1 + gh);
+    SelectObject(dc, oldGloss);
+    SelectObject(dc, oldGlossPen);
+    DeleteObject(gloss);
 }
 
 // Shared header band drawn at the top of the Settings and Macro Editor windows.
@@ -625,13 +695,11 @@ void DrawThemedHeader(HWND hwnd, HDC dc, const char* title) {
     TextOutA(dc, 58, 15, title, (int)strlen(title));
     SelectObject(dc, old);
 
-    // macOS-style title bar dots: red = close, yellow = minimize
-    HBRUSH hbrRed = CreateSolidBrush(RGB(255, 95, 86));
-    HBRUSH hbrYellow = CreateSolidBrush(RGB(255, 189, 46));
-    SelectObject(dc, hbrRed);   Ellipse(dc, rc.right - 46, 12, rc.right - 28, 30);
-    SelectObject(dc, hbrYellow);Ellipse(dc, rc.right - 70, 12, rc.right - 52, 30);
-    DeleteObject(hbrRed);
-    DeleteObject(hbrYellow);
+    // macOS-style title bar dots: red = close, yellow = minimize (animated)
+    DotAnims& da = g_dotAnims[hwnd];
+    float pulse = 0.5f + 0.5f * sinf(g_statusPhase * 2.f);
+    DrawHeaderDot(dc, rc.right - 37, 21, true,  da.close, pulse);
+    DrawHeaderDot(dc, rc.right - 61, 21, false, da.mini,  pulse);
 }
 
 // Custom title bar hit testing for the macOS-style dots. The dots themselves
@@ -1968,6 +2036,16 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             // Windows paint its own caption glyphs over them.
             if (HandleHeaderDotClick(hwnd, lParam)) return 0;
             break;
+        case WM_MOUSEMOVE: {
+            POINT pt = {(int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam)};
+            SetPropA(hwnd, "DotHover", (HANDLE)(INT_PTR)HeaderDotAt(hwnd, pt.x, pt.y));
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+            break;
+        }
+        case WM_MOUSELEAVE:
+            SetPropA(hwnd, "DotHover", (HANDLE)0);
+            break;
         case WM_SHOWWINDOW: {
             RECT rc;
             GetWindowRect(hwnd, &rc);
@@ -2403,6 +2481,16 @@ LRESULT CALLBACK MacroEditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             return HeaderHitTest(hwnd, lParam);
         case WM_LBUTTONDOWN:
             if (HandleHeaderDotClick(hwnd, lParam)) return 0;
+            break;
+        case WM_MOUSEMOVE: {
+            POINT pt = {(int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam)};
+            SetPropA(hwnd, "DotHover", (HANDLE)(INT_PTR)HeaderDotAt(hwnd, pt.x, pt.y));
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+            break;
+        }
+        case WM_MOUSELEAVE:
+            SetPropA(hwnd, "DotHover", (HANDLE)0);
             break;
         case WM_CREATE: {
             EnableDarkTitleBar(hwnd);
