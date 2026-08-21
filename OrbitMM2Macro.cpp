@@ -172,7 +172,7 @@ struct Config {
 // ==============================
 //  Update detector (GitHub releases)
 // ==============================
-static const char* g_currentVersion = "2.0.0";
+static const char* g_currentVersion = "2.1.0";
 static std::string g_lastNotifiedVersion;
 
 // Forward declarations
@@ -223,6 +223,11 @@ LRESULT CALLBACK HintWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 #define COL_TEXT      RGB(235,235,238)  // primary text
 #define COL_TEXT_DIS  RGB(140,140,144)  // disabled text
 #define COL_BORDER    RGB(58,58,64)
+
+// Neon accent palette for glow effects
+#define COL_NEON      RGB(255, 60, 75)
+#define COL_GLOW_OUTER RGB(255, 130, 140)
+#define COL_PULSE     RGB(255, 200, 210)
 
 static HBRUSH g_hbrBg     = NULL;
 static HBRUSH g_hbrEdit   = NULL;
@@ -704,7 +709,7 @@ void DrawThemedHeader(HWND hwnd, HDC dc, const char* title) {
     TextOutA(dc, 58, 15, title, (int)strlen(title));
     SelectObject(dc, old);
 
-    // macOS-style title bar dots: red = close, yellow = minimize (animated)
+    // macOS-style title bar dots: red = minimize to tray, yellow = minimize to taskbar (animated)
     DotAnims& da = g_dotAnims[hwnd];
     float pulse = 0.5f + 0.5f * sinf(g_statusPhase * 2.f);
     DrawHeaderDot(dc, rc.right - 37, 21, true,  da.close, pulse);
@@ -743,8 +748,8 @@ static int HeaderDotAt(HWND hwnd, int x, int y) {
 // Returns true if the click was consumed.
 static bool HandleHeaderDotClick(HWND hwnd, LPARAM lParam) {
     int dot = HeaderDotAt(hwnd, (int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam));
-    if (dot == 1) { SendMessage(hwnd, WM_CLOSE, 0, 0); return true; }      // quit
-    if (dot == 2) { SendMessage(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0); return true; }
+    if (dot == 1) { AnimateWindow(hwnd, 130, AW_HIDE | AW_BLEND); return true; }  // red -> hide to tray
+    if (dot == 2) { ShowWindow(hwnd, SW_MINIMIZE); return true; }                 // yellow -> normal taskbar minimize
     return false;
 }
 
@@ -2231,7 +2236,20 @@ int allIds[] = {110,111,501,601,602,603,1101,1102,1103,
             // Only repaint the damaged region with the gradient; the header
             // band (with its animated sweep) is repainted when damaged too.
             FillRect(dc, &ps.rcPaint, g_hbrBgGrad);
-            if (ps.rcPaint.top < 55) DrawThemedHeader(hwnd, dc, "Orbit MM2 Macro - Settings");
+            if (ps.rcPaint.top < 55) {
+                // Double-buffer the animated header into a memory bitmap and
+                // blit it in one shot so per-frame redraws never flicker.
+                RECT rc; GetClientRect(hwnd, &rc);
+                int w = rc.right > 0 ? rc.right : 1;
+                HDC mem = CreateCompatibleDC(dc);
+                HBITMAP bmp = CreateCompatibleBitmap(dc, w, 55);
+                HGDIOBJ oldBmp = SelectObject(mem, bmp);
+                DrawThemedHeader(hwnd, mem, "Orbit MM2 Macro - Settings");
+                BitBlt(dc, 0, 0, w, 55, mem, 0, 0, SRCCOPY);
+                SelectObject(mem, oldBmp);
+                DeleteObject(bmp);
+                DeleteDC(mem);
+            }
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -2356,7 +2374,7 @@ int allIds[] = {110,111,501,601,602,603,1101,1102,1103,
                         g_editingNew = false;
                     }
                     if (g_hwndMacroEditor) DestroyWindow(g_hwndMacroEditor);
-                    g_hwndMacroEditor = CreateWindowExA(0, "MacroEditorClass", "Edit Macro",
+                    g_hwndMacroEditor = CreateWindowExA(WS_EX_APPWINDOW, "MacroEditorClass", "Edit Macro",
                                                         WS_POPUP | WS_BORDER | WS_SYSMENU | WS_MINIMIZEBOX,
                                                         CW_USEDEFAULT, CW_USEDEFAULT, 340, 410,
                                                         hwnd, NULL, GetModuleHandle(NULL), NULL);
@@ -2662,7 +2680,19 @@ LRESULT CALLBACK MacroEditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
             FillRect(dc, &ps.rcPaint, g_hbrBgGrad);
-            if (ps.rcPaint.top < 55) DrawThemedHeader(hwnd, dc, "Edit Macro");
+            if (ps.rcPaint.top < 55) {
+                // Double-buffered header blit (flicker-free animation).
+                RECT rc; GetClientRect(hwnd, &rc);
+                int w = rc.right > 0 ? rc.right : 1;
+                HDC mem = CreateCompatibleDC(dc);
+                HBITMAP bmp = CreateCompatibleBitmap(dc, w, 55);
+                HGDIOBJ oldBmp = SelectObject(mem, bmp);
+                DrawThemedHeader(hwnd, mem, "Edit Macro");
+                BitBlt(dc, 0, 0, w, 55, mem, 0, 0, SRCCOPY);
+                SelectObject(mem, oldBmp);
+                DeleteObject(bmp);
+                DeleteDC(mem);
+            }
             EndPaint(hwnd, &ps);
             return 0;
         }
@@ -2718,7 +2748,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (lParam == WM_LBUTTONDBLCLK) {
                 // Double-click tray icon → restore settings window
                 if (!g_hwndSettings) {
-                    g_hwndSettings = CreateWindowExA(0, "SettingsClass", "Orbit MM2 Settings",
+                    g_hwndSettings = CreateWindowExA(WS_EX_APPWINDOW, "SettingsClass", "Orbit MM2 Settings",
                                                      WS_POPUP | WS_BORDER | WS_SYSMENU | WS_MINIMIZEBOX,
                                                      CW_USEDEFAULT, CW_USEDEFAULT, 740, 470,
                                                      hwnd, NULL, GetModuleHandle(NULL), NULL);
@@ -2746,7 +2776,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             switch (LOWORD(wParam)) {
 case ID_TRAY_SETTINGS: {
                     if (!g_hwndSettings) {
-g_hwndSettings = CreateWindowExA(0, "SettingsClass", "Orbit MM2 Settings",
+g_hwndSettings = CreateWindowExA(WS_EX_APPWINDOW, "SettingsClass", "Orbit MM2 Settings",
                                                      WS_POPUP | WS_BORDER | WS_SYSMENU | WS_MINIMIZEBOX,
                                                      CW_USEDEFAULT, CW_USEDEFAULT, 740, 470,
                                                      hwnd, NULL, GetModuleHandle(NULL), NULL);
